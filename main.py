@@ -135,6 +135,19 @@ def update_extension_bundle_ids(app_bundle, old_parent_id, new_parent_id):
         if not old_ext_id:
             continue
 
+        # Xử lý suffix: giữ nguyên phần extension nếu nó là sub-identifier
+        if old_ext_id.startswith(old_parent_id + "."):
+            # Extension theo format: com.app.widget -> com.app-team.widget
+            suffix = old_ext_id[len(old_parent_id):]
+            new_ext_id = new_parent_id + suffix
+        elif "." in old_ext_id:
+            # Fallback: lấy phần sau dấu chấm cuối cùng
+            last_part = old_ext_id.rsplit(".", 1)[-1]
+            new_ext_id = new_parent_id + "." + last_part
+        else:
+            # Không có suffix rõ ràng, thêm mặc định
+            new_ext_id = new_parent_id + "-ext"
+        
         if old_ext_id.startswith(old_parent_id):
             suffix = old_ext_id[len(old_parent_id):]
         else:
@@ -561,62 +574,13 @@ def do_sideload(ipa_path, apple_id, password):
     if extension_prov_paths is None:
         return False
 
-    # === TRÍCH XUẤT ENTITLEMENTS (CHO APP CHA) ===
-    entitlements_path = os.path.join(WORK_DIR, "entitlements.plist")
-    ent_dict = extract_entitlements(prov_path)
-    if ent_dict:
-        save_entitlements(ent_dict, entitlements_path)
-        log_ok(f"Đã trích xuất entitlements: {entitlements_path}")
-    else:
-        log_warn("Không trích xuất được entitlements - dùng entitlements mặc định.")
-
-    log_step(6, "Ký IPA bằng zsign")
-    if not check_zsign():
-        return False
-    zsign_path = find_zsign()
-    if not zsign_path:
-        return False
-
-    signed_ipa = os.path.join(WORK_DIR, f"{app_name}_signed.ipa")
-    tmp_dir = os.path.join(WORK_DIR, "zsign_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    # Truyền nhiều -m: 1 cho app cha, thêm 1 cho mỗi extension.
-    # zsign (bản mới) tự khớp từng profile với đúng bundle bên trong
-    # dựa theo bundle ID ghi trong profile đó.
-    zsign_cmd = [
-        zsign_path,
-	"-t", tmp_dir,
-        "-f",
-        "-k", key_pem_path,
-        "-c", cert_pem_path,
-        "-m", prov_path,
-	"-e", entitlements_path,
+    if entitlements_path and os.path.exists(entitlements_path):
+        zsign_cmd += ["-e", entitlements_path]
     ]
 
     for ext_prov_path in extension_prov_paths:
         zsign_cmd += ["-m", ext_prov_path]
 
-    zsign_cmd += [
-        "-o", signed_ipa,
-        app_bundle
-    ]
-
-    try:
-        utils.run_command(zsign_cmd)
-        log_ok(f"Đã ký IPA: {signed_ipa}")
-    except Exception as e:
-        log_error(f"Ký IPA thất bại: {e}")
-        return False
-
-    log_step(7, "Pairing & Cài đặt")
-    pair = device_link.pair_device(udid)
-    if not pair:
-        log_error("Pairing thất bại.")
-        return False
-    log_ok("Pairing thành công.")
-    device_link.install_ipa(pair, signed_ipa)
-    log_ok("Cài đặt thành công!")
     return True
 
 def do_revoke_certs(apple_id, password):
@@ -769,3 +733,126 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ Lỗi: {e}")
         sys.exit(1)
+
+     # === TRÍCH XUẤT ENTITLEMENTS (CHO APP CHA) ===
+     entitlements_path = None
+     ent_dict = extract_entitlements(prov_path)
+     if ent_dict and len(ent_dict) > 0:
+         ent_file = os.path.join(WORK_DIR, "entitlements.plist")
+         try:
+             save_entitlements(ent_dict, ent_file)
+             if os.path.exists(ent_file):
+                 entitlements_path = ent_file
+                 log_ok(f"Đã trích xuất entitlements ({len(ent_dict)} mục)")
+             else:
+                 log_warn("Không lưu được entitlements file, bỏ qua flag -e")
+         except Exception as e:
+             log_warn(f"Lỗi lưu entitlements: {e} - bỏ qua flag -e")
+     else:
+         log_warn("Entitlements rỗng - sẽ dùng provisioning profile mặc định")
+
+     log_step(6, "Ký IPA bằng zsign")
+     if not check_zsign():
+         return False
+     zsign_path = find_zsign()
+     if not zsign_path:
+         return False
+
+     signed_ipa = os.path.join(WORK_DIR, f"{app_name}_signed.ipa")
+     tmp_dir = os.path.join(WORK_DIR, "zsign_tmp")
+     os.makedirs(tmp_dir, exist_ok=True)
+
+     # === ZSIGN COMMAND ===
+     zsign_cmd = [
+         zsign_path,
+         "-t", tmp_dir,
+         "-f",
+         "-k", key_pem_path,
+         "-c", cert_pem_path,
+         "-m", prov_path,
+     ]
+
+     # Thêm entitlements CHỈ khi file tồn tại
+     if entitlements_path and os.path.exists(entitlements_path):
+         zsign_cmd += ["-e", entitlements_path]
+         log_info(f"Dùng custom entitlements: {entitlements_path}")
+
+     # Thêm extension provisioning profiles
+     for ext_prov_path in extension_prov_paths:
+         if os.path.exists(ext_prov_path):
+             zsign_cmd += ["-m", ext_prov_path]
+
+     zsign_cmd += ["-o", signed_ipa, app_bundle]
+
+     log_info(f"📝 Zsign command: {' '.join(zsign_cmd[:5])} ... {app_bundle}")
+     try:
+         utils.run_command(zsign_cmd)
+         log_ok(f"✅ Đã ký IPA: {signed_ipa}")
+     except Exception as e:
+         log_error(f"❌ Ký IPA thất bại: {e}")
+         if hasattr(e, '__traceback__'):
+             import traceback
+             log_error(f"Traceback: {traceback.format_exc()}")
+         return False
+
+
+     log_step(6, "Ký IPA bằng zsign")
+     if not check_zsign():
+         return False
+     zsign_path = find_zsign()
+     if not zsign_path:
+         return False
+
+     signed_ipa = os.path.join(WORK_DIR, f"{app_name}_signed.ipa")
+     tmp_dir = os.path.join(WORK_DIR, "zsign_tmp")
+     os.makedirs(tmp_dir, exist_ok=True)
+
+     # === KIỂM TRA TEAM PROFILE CÓ COVER EXTENSIONS KHÔNG ===
+     # Nếu là Free Account → chỉ có Team Profile cho app chính
+     # Extensions sẽ gây conflict → xóa luôn
+     plugins_dir = os.path.join(app_bundle, "PlugIns")
+     watch_dir = os.path.join(app_bundle, "Watch")
+     
+     if os.path.exists(plugins_dir):
+         log_warn("⚠️ Phát hiện PlugIns (Extensions)")
+         log_info("🗑️ Xóa Extensions để tránh lỗi Profile conflict...")
+         try:
+             shutil.rmtree(plugins_dir)
+             log_ok("✅ Đã xóa PlugIns/")
+         except Exception as e:
+             log_error(f"❌ Không xóa được PlugIns: {e}")
+     
+     if os.path.exists(watch_dir):
+         log_info("🗑️ Xóa Watch app...")
+         try:
+             shutil.rmtree(watch_dir)
+             log_ok("✅ Đã xóa Watch/")
+         except Exception as e:
+             log_error(f"⚠️ Không xóa được Watch: {e}")
+
+     # === ZSIGN COMMAND (CHỈ APP CHÍNH) ===
+     zsign_cmd = [
+         zsign_path,
+         "-t", tmp_dir,
+         "-f",
+         "-k", key_pem_path,
+         "-c", cert_pem_path,
+         "-m", prov_path,
+     ]
+
+     # Thêm entitlements CHỈ khi file tồn tại
+     if entitlements_path and os.path.exists(entitlements_path):
+         zsign_cmd += ["-e", entitlements_path]
+         log_info(f"Dùng custom entitlements")
+
+     zsign_cmd += ["-o", signed_ipa, app_bundle]
+
+     log_info(f"📝 Ký IPA: {app_name}")
+     log_info(f"Command: zsign ... {app_bundle}")
+     try:
+         utils.run_command(zsign_cmd)
+         log_ok(f"✅ Đã ký thành công: {signed_ipa}")
+     except Exception as e:
+         log_error(f"❌ Ký IPA thất bại: {e}")
+         return False
+
