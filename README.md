@@ -34,8 +34,8 @@
 | **Termux** | Phiên bản mới nhất |
 | **iPhone** | iOS 12.0+ (đã jailbreak hoặc SideStore/AltStore) |
 | **Python** | 3.7+ |
-| **zsign** | Đã cài đặt |
-| **libimobiledevice** | Đã cài đặt |
+| **zsign** | yêu cầu |
+| **libimobiledevice** | yêu cầu |
 
 ---
 
@@ -47,7 +47,7 @@
 pkg update && pkg upgrade -y
 pkg install -y python git unzip wget
 pkg install -y libimobiledevice usbmuxd ideviceinstaller
-pkg install -y zsign
+hãy vào trang chính thức của zsign để tải bản phù hợp với kiến trúc và hệ điều hành của bạn khuyến nghị 32bit dùng bản có sẵn
 ```
 
 2. Clone repository
