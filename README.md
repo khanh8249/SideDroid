@@ -23,6 +23,8 @@
 - 🚀 **Tự động cài đặt** - Cài IPA trực tiếp lên iPhone sau khi ký
 - 🔄 **Quản lý Certificate** - Tạo và thu hồi certificate tự động
 - 💾 **Lưu thông tin** - Lưu Apple ID và mật khẩu để sử dụng sau
+- 🔑🔒mọi thông tin của các bạn sẽ lưu vào local hoặc gửi lên apple không phải lưu vào các server khác
+- ⛔️ không nên lạm dụng tool vào mục đích trộm cắp, mã độc và botnet mọi vi phạm đều sẽ trả giá trước pháp luật
 
 ---
 
