@@ -1,10 +1,3 @@
-Mình sẽ tạo một file README.md chuyên nghiệp, đầy đủ thông tin cho dự án SideDroid của bạn.
-
----
-
-File README.md cho SideDroid
-
-```markdown
 # 📱 SideDroid
 
 <p align="center">
@@ -111,8 +104,9 @@ Bước 1: Thiết lập USB (lần đầu)
 ```
 📌 Chọn menu 3: Thiết lập USB & USBMUXD
 👉 Kết nối iPhone qua cáp USB
-👉 Cắm iPhone và mở khóa màn hình
-👉 Bấm "Trust" trên iPhone khi được hỏi
+👉 `hiện cho phép kết nốt với iphone trên termux thì hãy nhanh tay bấm vào đồng ý nếu không được thì hãy kill usbmuxd rồi vào bước 3 của menu`
+👉 `Cắm iPhone và mở khóa màn hình`
+👉 `Bấm "Trust" trên iPhone khi được hỏi
 ```
 
 Bước 2: Sideload IPA
@@ -152,9 +146,9 @@ SideDroid/
 
 🔑 Hỗ trợ Apple ID
 
-Loại tài khoản App ID Extension Giới hạn
+`Loại tài khoản App ID Extension Giới hạn
 Free 1-2 ⚠️ Giới hạn 3 app / 7 ngày
-Paid ($99/năm) Không giới hạn ✅ Đầy đủ Không giới hạn
+Paid ($99/năm) Không giới hạn ✅ Đầy đủ Không giới hạn`
 
 ---
 
@@ -233,7 +227,6 @@ Công cụ này chỉ dành cho mục đích học tập và nghiên cứu. Ngư
 
 · Tác giả: @khanh8249
 · Issue: GitHub Issues
-· Discord: Tham gia Discord
 
 ---
 
@@ -268,5 +261,3 @@ Bạn có thể thêm các badge sau vào đầu file:
 ```
 
 ---
-
-Bạn muốn thêm hoặc sửa phần nào trong README không? 😊
