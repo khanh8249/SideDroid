@@ -244,20 +244,6 @@ plistlib>=1.0
 typing-extensions>=4.0.0
 ```
 
----
-
-🎯 Bonus: Thêm badge cho README
-
-Bạn có thể thêm các badge sau vào đầu file:
-
-```markdown
-<p align="center">
-  <img src="https://img.shields.io/github/stars/khanh8249/SideDroid?style=social" alt="Stars">
-  <img src="https://img.shields.io/github/forks/khanh8249/SideDroid?style=social" alt="Forks">
-  <img src="https://img.shields.io/github/watchers/khanh8249/SideDroid?style=social" alt="Watchers">
-  <img src="https://img.shields.io/github/last-commit/khanh8249/SideDroid" alt="Last Commit">
-  <img src="https://img.shields.io/github/issues/khanh8249/SideDroid" alt="Issues">
-</p>
-```
+--
 
 ---
