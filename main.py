@@ -314,7 +314,8 @@ def setup_usb_connection():
     log_info("Đang xin quyền truy cập USB...")
     subprocess.run(["termux-usb", "-r", usb_path], timeout=10)
     log_ok("Đã gửi yêu cầu quyền. Bấm OK trên popup Android.")
-
+    time.sleep(5)
+    
     log_info("Đang khởi động usbmuxd...")
     cmd = f"termux-usb -r -E -e \"usbmuxd -f -p\" {usb_path}"
     log_info(f"Command: {cmd}")
