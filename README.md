@@ -233,17 +233,7 @@ Công cụ này chỉ dành cho mục đích học tập và nghiên cứu. Ngư
 <p align="center">
   Made with ❤️ by khanh8249
 </p>
-```---
-
-📦 File requirements.txt (nếu cần)
-
-```txt
-requests>=2.28.0
-pycryptodome>=3.15.0
-plistlib>=1.0
-typing-extensions>=4.0.0
-```
-
+```-
 --
 
 ---
