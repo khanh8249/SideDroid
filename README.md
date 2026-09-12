@@ -25,7 +25,7 @@
 - 💾 **Lưu thông tin** - Lưu Apple ID và mật khẩu để sử dụng sau
 - 🔑🔒mọi thông tin của các bạn sẽ lưu vào local hoặc gửi lên apple không phải lưu vào các server khác
 - ⛔️ không nên lạm dụng tool vào mục đích trộm cắp, mã độc và botnet mọi vi phạm đều sẽ trả giá trước pháp luật
-
+- 😘 tool luôn luôn mã nguồn mở cho nên các bạn yên tâm vì có thể biết công cụ đó hoạt động ra sao
 ---
 
 ## 📋 Yêu cầu hệ thống
