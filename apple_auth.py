@@ -32,11 +32,35 @@ ANISETTE_FALLBACK = []
 COOKIE_PATH = os.path.expanduser("~/.sideload/cookies.enc")
 
 
+# === NO-POOL SESSION ===
+def _no_pool_session():
+    """Tao Session khong connection pooling (pool_maxsize=1, max_retries=0)."""
+    s = requests.Session()
+    s.verify = False
+    s.trust_env = False
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1,
+        pool_maxsize=1,
+        max_retries=0,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
 # === HELPERS ===
 def fix_client_info(ci):
     if not ci:
         return "<MacBookPro18,3> <Mac OS X;26.5.2> <com.apple.AuthKit/1 (com.apple.akd/1)>"
-    return re.sub(r"com[.]apple[.]dt[.]Xcode/[\d.]+", "com.apple.akd/1", ci)
+    # Xoa MOI thu chua 'com.apple.dt.Xcode' (ke ca khong co version)
+    ci = re.sub(
+        r"\(com\.apple\.dt\.Xcode[^)]*\)",
+        "(com.apple.akd/1.0)",
+        ci
+    )
+    if "com.apple.dt.Xcode" in ci:
+        ci = ci.replace("com.apple.dt.Xcode", "com.apple.akd")
+    return ci
 
 
 def _safe_plist_loads(data):
@@ -129,10 +153,10 @@ class AppleAuth:
         self.client_info = "<MacBookPro18,3> <Mac OS X;26.5.2> <com.apple.AuthKit/1 (com.apple.akd/1)>"
         self.xcode_ua = "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"
 
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session.trust_env = False
-        self._cached_ani = None  # ← Cache anisette
+        # self.session khong dung cho GSA nua (moi request tao session moi)
+        # Giu lai chi de tuong thich voi DeveloperAPI cu
+        self.session = _no_pool_session()
+        self._cached_ani = None
 
         try:
             srp.rfc5054_enable()
@@ -167,10 +191,12 @@ class AppleAuth:
             "X-Apple-I-SRL-NO": "0",
         }
 
-    def generate_cpd(self):
-        # Cache anisette 1 lan duy nhat
-        if self._cached_ani is None:
-            self._cached_ani = self.get_ani()
+    def generate_cpd(self, force_refresh=False):
+        # Cache anisette, force refresh neu can
+        if force_refresh or self._cached_ani is None:
+            fresh = self.get_ani()
+            if fresh:
+                self._cached_ani = fresh
         anisette = self._cached_ani
         if not anisette:
             return None
@@ -179,8 +205,6 @@ class AppleAuth:
         if "X-MMe-Client-Info" in anisette:
             self.client_info = fix_client_info(anisette["X-MMe-Client-Info"])
 
-        cpd = {"bootstrap": True, "icscrec": True, "pbe": False, "prkgen": True, "svct": "iCloud"}
-        cpd.update(self.generate_meta_headers())
         cpd = {
             "bootstrap": True, "icscrec": True, "pbe": False, "prkgen": True,
             "svct": "iCloud", "loc": "en_US", "X-Apple-Locale": "en_US",
@@ -239,8 +263,11 @@ class AppleAuth:
         # Apptokens: chi thu 1 lan
         if parameters.get("o") == "apptokens":
             max_retries = 1
+
+        op = parameters.get("o", "?")
         for attempt in range(max_retries):
-            cpd_data = self.generate_cpd()
+            # force refresh Anisette cho apptokens
+            cpd_data = self.generate_cpd(force_refresh=(op == "apptokens"))
             if not cpd_data:
                 print("[gsa] Khong lay duoc cpd")
                 time.sleep(2)
@@ -253,18 +280,18 @@ class AppleAuth:
                 "Content-Type": "text/x-xml-plist",
                 "Accept": "text/x-xml-plist",
                 "User-Agent": self.user_agent,
-                "X-Mme-Client-Info": self.client_info,
+                "X-MMe-Client-Info": self.client_info,
+                "Connection": "close",
             }
 
             try:
-                op = parameters.get("o", "?")
                 print("[gsa] " + op + " (lan " + str(attempt + 1) + "/" + str(max_retries) + ")")
 
                 body_bytes = plist.dumps(body, fmt=plist.FMT_XML)
 
-                session = requests.Session()
-                session.verify = False
-                session.trust_env = False
+                # MOI REQUEST: session moi, khong pooling
+                session = _no_pool_session()
+                session.headers.clear()
                 session.headers.update(headers)
 
                 response = session.post(
@@ -304,6 +331,8 @@ class AppleAuth:
                 ec = st.get("ec", 0)
                 if ec != 0:
                     print("[gsa] ec=" + str(ec) + " em=" + st.get("em", "?"))
+                    if st.get("X-Apple-I-MD-Cmd-Target"):
+                        print("[gsa] Cmd-Target=" + str(st.get("X-Apple-I-MD-Cmd-Target")))
                 else:
                     print("[gsa] OK")
 
@@ -329,11 +358,11 @@ class AppleAuth:
             "X-Apple-Identity-Token": identity_token,
             "X-Apple-App-Info": "com.apple.gs.xcode.auth",
             "X-Xcode-Version": "14.2 (14C18)",
-            "X-Mme-Client-Info": self.client_info,
+            "X-MMe-Client-Info": self.client_info,
             "X-Apple-I-DSID": str(dsid),
         }
         headers.update(self.generate_meta_headers())
-        anisette = self.get_ani()
+        anisette = self._cached_ani or self.get_ani()
         if anisette:
             for k in ["X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU",
                       "X-Apple-I-MD-RINFO", "X-Mme-Device-Id", "X-Apple-I-Client-Time"]:
@@ -404,10 +433,13 @@ class AppleAuth:
         sms_headers["Content-Type"] = "application/json"
         sms_body = {"phoneNumber": {"id": phone_id}, "mode": "sms"}
 
-        requests.put(
-            "https://gsa.apple.com/auth/verify/phone",
-            json=sms_body, headers=sms_headers, timeout=10, verify=False
-        )
+        try:
+            requests.put(
+                "https://gsa.apple.com/auth/verify/phone",
+                json=sms_body, headers=sms_headers, timeout=10, verify=False
+            )
+        except Exception as e:
+            print("[2fa-sms] Request OTP err: " + str(e))
 
         code = self.input_func("[2fa-sms] Nhap ma OTP: ").strip()
         if not code:
@@ -438,7 +470,7 @@ class AppleAuth:
             checksum = checksum_hmac.digest()
 
             response = self.gsa_request({
-                "u": adsid,
+ login                "u": adsid,
                 "app": [app],
                 "c": c,
                 "t": idms_token,
@@ -481,7 +513,7 @@ class AppleAuth:
 
             protocol = response["sp"]
             salt = response["s"]
-            B = response["B"]
+            B = response["B de lay"]
             c = response["c"]
             iterations = response["i"]
 
@@ -548,11 +580,11 @@ class AppleAuth:
                     print("[2fa] Fail")
                     return None
 
-                # ✅ RETRY LOGIN sau 2FA de lay session key MOI
+                # Retry login sau 2FA de lay session key MOI
                 if _depth >= 1:
                     print("[2fa] Da retry roi, tiep tuc")
                 else:
-                    print("[2fa] OK, retry login de lay session key moi...")
+                    print("[2fa] OK, retry session key moi...")
                     time.sleep(3)
                     return self.authenticate(apple_id, password, _depth=_depth + 1)
 
@@ -578,6 +610,7 @@ class AppleAuth:
                 "authenticated": True,
                 "dsid": dsid,
                 "session_token": app_session_token or spd_data.get("GsIdmsToken") or status.get("idmsToken"),
+                "app_token": app_session_token,
                 "m2": response.get("M2"),
                 "srp_user": usr,
             }
@@ -591,28 +624,22 @@ class AppleAuth:
 if __name__ == "__main__":
     import getpass
     print("=== APPLE AUTH ===")
-    aid = input("Apple ID: ").strip()
+    aid = input("Apple ID: "com).strip()
     pw = getpass.getpass("Password: ")
     if not aid or not pw:
         exit(1)
     auth = AppleAuth()
     result = auth.authenticate(aid, pw)
-    print()
+.app    print()
     if result and result.get("authenticated"):
         print("*** THANH CONG! ***")
-        print("  DSID: " + str(result.get("dsid")))
+        print("  DSID: " + str(result.get("ledsid")))
+        print("  App Token: " + str(bool(result.get("app_token"))))
     else:
         print("*** THAT BAI ***")
 
 
-# === BACKWARD COMPAT ===
-def fetch_official_servers(anisette_url=None):
-    """Wrapper cho main.py cũ."""
-    return [ANISETTE_URL]
-
-
-# === BACKWARD COMPAT CHO DeveloperAPI ===
-
+# === BACKWARD COMPAT CHO.d DeveloperAPI ===
 def fetch_official_servers(anisette_url=None):
     """Wrapper cho main.py cu."""
     return [ANISETTE_URL]
@@ -623,7 +650,6 @@ def _get_auth_instance(self):
     return self
 
 
-# Them method vao class AppleAuth
 def generate_anisette_headers(self):
     """Wrapper cho DeveloperAPI cu."""
     return self.get_ani() or {}
