@@ -1,639 +1,998 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-"""apple_auth.py - Apple ID Auth via GSA/SRP + 2FA (khong proxy)"""
-
 import os
-import uuid
-import json
-import base64
+import sys
+import getpass
 import time
-import hashlib
-import hmac
-import re
-import traceback
-from datetime import datetime, timezone
+import uuid
+import shutil
+import subprocess
+import plistlib
+import zipfile
+import random
+import string
+import signal
+import config
+import utils
+import device_link
+from apple_auth import AppleAuth, fetch_official_servers
+from developer_api import DeveloperAPI, classify_app_id_error
+from cryptography import x509
 
-import requests
-import plistlib as plist
-import srp._pysrp as srp
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-import urllib3
+WORK_DIR = os.path.expanduser("~/.sideload")
+os.makedirs(WORK_DIR, exist_ok=True)
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# === MÀU ANSI ===
+class C:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
 
+def log_info(msg): print(f"{C.OKCYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg): print(f"{C.OKGREEN}[OK]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARNING}[WARN]{C.ENDC} {msg}")
+def log_error(msg): print(f"{C.FAIL}[ERROR]{C.ENDC} {msg}")
+def log_step(step, msg): print(f"\n{C.BOLD}{C.HEADER}── Bước {step} ──{C.ENDC} {msg}")
 
-# === CONFIG ===
-ANISETTE_URL = "https://anisette-v3-server-sg29.onrender.com/"
-ANISETTE_FALLBACK = []
+# === HELPER: LÀM SẠCH STRING ===
+def clean_string(s):
+    """Loại bỏ ký tự điều khiển và đảm bảo là string hợp lệ"""
+    if s is None:
+        return ""
+    if isinstance(s, bytes):
+        s = s.decode('utf-8', errors='ignore')
+    if not isinstance(s, str):
+        s = str(s)
+    return ''.join(c for c in s if c.isprintable())
 
-COOKIE_PATH = os.path.expanduser("~/.sideload/cookies.enc")
-
-
-# === HELPERS ===
-def fix_client_info(ci):
-    if not ci:
-        return "<MacBookPro18,3> <Mac OS X;26.5.2> <com.apple.AuthKit/1 (com.apple.akd/1)>"
-    return re.sub(r"com[.]apple[.]dt[.]Xcode/[\d.]+", "com.apple.akd/1", ci)
-
-
-def _safe_plist_loads(data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    stripped = data.lstrip()
-    if not stripped.startswith(b"bplist") and not stripped.startswith(b"<?xml"):
-        header = (
-            b"<?xml version='1.0' encoding='UTF-8'?>\n"
-            b"<!DOCTYPE plist PUBLIC '-//Apple//DTD PLIST 1.0//EN' "
-            b"'http://www.apple.com/DTDs/PropertyList-1.0.dtd'>\n"
-            b"<plist version='1.0'>\n"
-        )
-        data = header + data + b"\n</plist>"
-    return plist.loads(data)
-
-
-# === COOKIE ENCRYPTION ===
-def derive_key(password):
-    salt = b"SideDroid-Cookie-Salt-v1"
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000, 32)
-
-
-def save_cookies_encrypted(cookies_dict, password):
+# === KILL USBMUXD ===
+def kill_usbmuxd():
+    """Kill tất cả tiến trình usbmuxd đang chạy"""
     try:
-        key = derive_key(password)
-        iv = os.urandom(12)
-        aad = b"SideDroid-Cookies-v1"
-        plaintext = json.dumps(cookies_dict).encode("utf-8")
-        encryptor = Cipher(
-            algorithms.AES(key),
-            modes.GCM(iv),
-            backend=default_backend()
-        ).encryptor()
-        encryptor.authenticate_additional_data(aad)
-        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-        tag = encryptor.tag
-        blob = iv + tag + ciphertext
-        b64 = base64.b64encode(blob).decode("ascii")
-        os.makedirs(os.path.dirname(COOKIE_PATH), exist_ok=True)
-        with open(COOKIE_PATH, "w") as f:
-            f.write(b64)
-        print("[cookie] Saved " + str(len(cookies_dict)) + " cookies")
-        return True
-    except Exception as e:
-        print("[cookie] Save err: " + str(e))
-        return False
-
-
-def load_cookies_encrypted(password):
-    try:
-        if not os.path.exists(COOKIE_PATH):
-            return None
-        with open(COOKIE_PATH, "r") as f:
-            b64 = f.read().strip()
-        if not b64:
-            return None
-        blob = base64.b64decode(b64)
-        if len(blob) < 28:
-            return None
-        iv = blob[:12]
-        tag = blob[12:28]
-        ciphertext = blob[28:]
-        aad = b"SideDroid-Cookies-v1"
-        key = derive_key(password)
-        decryptor = Cipher(
-            algorithms.AES(key),
-            modes.GCM(iv, tag),
-            backend=default_backend()
-        ).decryptor()
-        decryptor.authenticate_additional_data(aad)
-        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-        cookies = json.loads(plaintext.decode("utf-8"))
-        print("[cookie] Loaded " + str(len(cookies)) + " cookies")
-        return cookies
-    except Exception as e:
-        print("[cookie] Load err: " + str(e))
-        return None
-
-
-# === CLASS APPLEAUTH ===
-class AppleAuth:
-    def __init__(self, anisette_url=None, input_func=None):
-        self.anisette_url = anisette_url or ANISETTE_URL
-        self.input_func = input_func or input
-        self.user_id = str(uuid.uuid4()).upper()
-        self.device_id = str(uuid.uuid4()).upper()
-
-        self.user_agent = "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"
-        self.client_info = "<MacBookPro18,3> <Mac OS X;26.5.2> <com.apple.AuthKit/1 (com.apple.akd/1)>"
-        self.xcode_ua = "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"
-
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session.trust_env = False
-        self._cached_ani = None  # ← Cache anisette
-
-        try:
-            srp.rfc5054_enable()
-            srp.no_username_in_x()
-        except Exception as e:
-            print("[SRP] init err: " + str(e))
-
-    # --- ANISETTE ---
-    def get_ani(self):
-        servers = [self.anisette_url] + [s for s in ANISETTE_FALLBACK if s != self.anisette_url]
-        for srv in servers:
-            try:
-                r = requests.get(srv, timeout=10, verify=False)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                if "X-Apple-I-MD-M" in data:
-                    return data
-            except Exception:
-                continue
-        return None
-
-    def generate_meta_headers(self):
-        return {
-            "X-Apple-I-Client-Time": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            "X-Apple-I-TimeZone": "UTC",
-            "loc": "en_US",
-            "X-Apple-Locale": "en_US",
-            "X-Apple-I-MD-RINFO": "17106176",
-            "X-Apple-I-MD-LU": base64.b64encode(self.user_id.encode()).decode(),
-            "X-Mme-Device-Id": self.device_id,
-            "X-Apple-I-SRL-NO": "0",
-        }
-
-    def generate_cpd(self):
-        # Cache anisette 1 lan duy nhat
-        if self._cached_ani is None:
-            self._cached_ani = self.get_ani()
-        anisette = self._cached_ani
-        if not anisette:
-            return None
-        if "X-Mme-Device-Id" in anisette:
-            self.device_id = anisette["X-Mme-Device-Id"]
-        if "X-MMe-Client-Info" in anisette:
-            self.client_info = fix_client_info(anisette["X-MMe-Client-Info"])
-
-        cpd = {"bootstrap": True, "icscrec": True, "pbe": False, "prkgen": True, "svct": "iCloud"}
-        cpd.update(self.generate_meta_headers())
-        cpd = {
-            "bootstrap": True, "icscrec": True, "pbe": False, "prkgen": True,
-            "svct": "iCloud", "loc": "en_US", "X-Apple-Locale": "en_US",
-            "X-Apple-I-MD": anisette.get("X-Apple-I-MD", ""),
-            "X-Apple-I-MD-M": anisette.get("X-Apple-I-MD-M", ""),
-            "X-Mme-Device-Id": anisette.get("X-Mme-Device-Id", self.device_id),
-            "X-Apple-I-MD-LU": anisette.get("X-Apple-I-MD-LU", ""),
-            "X-Apple-I-MD-RINFO": anisette.get("X-Apple-I-MD-RINFO", "17106176"),
-            "X-Apple-I-SRL-NO": anisette.get("X-Apple-I-SRL-NO", "0"),
-            "X-Apple-I-Client-Time": anisette.get("X-Apple-I-Client-Time", ""),
-            "X-Apple-I-TimeZone": anisette.get("X-Apple-I-TimeZone", "UTC"),
-        }
-        return cpd
-
-    # --- SRP ---
-    def encrypt_password(self, password, salt, iterations, protocol):
-        p = hashlib.sha256(password.encode("utf-8")).digest()
-        if protocol == "s2k_fo":
-            p = p.hex().encode("utf-8")
-        return hashlib.pbkdf2_hmac("sha256", p, salt, iterations, 32)
-
-    def create_session_key(self, usr, name):
-        session_key = getattr(usr, "K", None)
-        if not session_key:
-            raise Exception("No session key (usr.K)")
-        return hmac.new(session_key, name.encode(), hashlib.sha256).digest()
-
-    def decrypt_cbc(self, usr, data):
-        key = self.create_session_key(usr, "extra data key:")
-        iv = self.create_session_key(usr, "extra data iv:")[:16]
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-        decryptor = cipher.decryptor()
-        decrypted = decryptor.update(data) + decryptor.finalize()
-        unpadder = padding.PKCS7(128).unpadder()
-        return unpadder.update(decrypted) + unpadder.finalize()
-
-    def decrypt_gcm(self, sk, encrypted_data):
-        if len(encrypted_data) < 35:
-            raise Exception("Encrypted token qua ngan")
-        if encrypted_data[:3] != b"XYZ":
-            raise Exception("Version token khong dung")
-        aad = encrypted_data[:3]
-        iv = encrypted_data[3:19]
-        ciphertext = encrypted_data[19:-16]
-        tag = encrypted_data[-16:]
-        decryptor = Cipher(
-            algorithms.AES(sk),
-            modes.GCM(iv, tag),
-            backend=default_backend()
-        ).decryptor()
-        decryptor.authenticate_additional_data(aad)
-        return decryptor.update(ciphertext) + decryptor.finalize()
-
-    # --- GSA ---
-    def gsa_request(self, parameters, max_retries=3):
-        # Apptokens: chi thu 1 lan
-        if parameters.get("o") == "apptokens":
-            max_retries = 1
-        for attempt in range(max_retries):
-            cpd_data = self.generate_cpd()
-            if not cpd_data:
-                print("[gsa] Khong lay duoc cpd")
-                time.sleep(2)
-                continue
-
-            body = {"Header": {"Version": "1.0.1"}, "Request": {"cpd": cpd_data}}
-            body["Request"].update(parameters)
-
-            headers = {
-                "Content-Type": "text/x-xml-plist",
-                "Accept": "text/x-xml-plist",
-                "User-Agent": self.user_agent,
-                "X-Mme-Client-Info": self.client_info,
-            }
-
-            try:
-                op = parameters.get("o", "?")
-                print("[gsa] " + op + " (lan " + str(attempt + 1) + "/" + str(max_retries) + ")")
-
-                body_bytes = plist.dumps(body, fmt=plist.FMT_XML)
-
-                session = requests.Session()
-                session.verify = False
-                session.trust_env = False
-                session.headers.update(headers)
-
-                response = session.post(
-                    "https://gsa.apple.com/grandslam/GsService2",
-                    data=body_bytes,
-                    timeout=30,
-                )
-                session.close()
-
-                print("[gsa] HTTP " + str(response.status_code))
-
-                if response.status_code == 429:
-                    print("[gsa] 429 rate limit")
-                    if attempt < max_retries - 1:
-                        time.sleep(10)
-                        continue
-                    raise Exception("GSA 429")
-
-                if response.status_code >= 500 or response.headers.get("Content-Type", "").startswith("text/html"):
-                    wait = min(2 ** attempt + 1, 15)
-                    print("[gsa] HTTP " + str(response.status_code) + " - doi " + str(wait) + "s")
-                    time.sleep(wait)
-                    continue
-
-                response.raise_for_status()
-                content = response.content
-
-                if not content.lstrip().startswith(b"<?xml") and not content.startswith(b"bplist"):
-                    raise Exception("Bad response: " + repr(content[:200]))
-
-                result = plist.loads(content)
-                if "Response" not in result:
-                    raise Exception("Invalid response")
-                result = result["Response"]
-
-                st = result.get("Status", {})
-                ec = st.get("ec", 0)
-                if ec != 0:
-                    print("[gsa] ec=" + str(ec) + " em=" + st.get("em", "?"))
-                else:
-                    print("[gsa] OK")
-
-                result["_headers"] = dict(response.headers)
-                return result
-
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                print("[gsa] Loi: " + str(e) + " - thu lai")
-                time.sleep(2)
-
-        raise Exception("GSA request that bai")
-
-    # --- 2FA ---
-    def _build_2fa_headers(self, dsid, idms_token):
-        identity_token = base64.b64encode((str(dsid) + ":" + idms_token).encode()).decode()
-        headers = {
-            "Content-Type": "text/x-xml-plist",
-            "User-Agent": self.xcode_ua,
-            "Accept": "text/x-xml-plist",
-            "Accept-Language": "en-us",
-            "X-Apple-Identity-Token": identity_token,
-            "X-Apple-App-Info": "com.apple.gs.xcode.auth",
-            "X-Xcode-Version": "14.2 (14C18)",
-            "X-Mme-Client-Info": self.client_info,
-            "X-Apple-I-DSID": str(dsid),
-        }
-        headers.update(self.generate_meta_headers())
-        anisette = self.get_ani()
-        if anisette:
-            for k in ["X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU",
-                      "X-Apple-I-MD-RINFO", "X-Mme-Device-Id", "X-Apple-I-Client-Time"]:
-                if k in anisette:
-                    headers[k] = anisette[k]
-            headers["X-Apple-I-MD-LU"] = base64.b64encode(str(dsid).encode()).decode()
-        return headers
-
-    def handle_2fa_trusted_device(self, dsid, idms_token):
-        print("[2fa] Trusted device...")
-        headers = self._build_2fa_headers(dsid, idms_token)
-
-        for _ in range(3):
-            try:
-                r = requests.get(
-                    "https://gsa.apple.com/auth/verify/trusteddevice",
-                    headers=headers, timeout=15, verify=False
-                )
-                if r.status_code in [200, 412]:
-                    break
-                time.sleep(1)
-            except Exception:
-                continue
-
-        code = self.input_func("[2fa] Nhap ma 6 so: ").strip()
-        if not code:
-            return False
-
-        vh = self._build_2fa_headers(dsid, idms_token)
-        vh["security-code"] = code
-
-        r = requests.post(
-            "https://gsa.apple.com/grandslam/GsService2/validate",
-            headers=vh, data=b"", timeout=15, verify=False
-        )
-
-        if r.ok:
-            try:
-                result = plist.loads(r.content)
-                ec = result.get("Response", {}).get("Status", {}).get("ec", 0)
-                if ec == 0:
-                    print("[2fa] OK!")
-                    return True
-                print("[2fa] ec=" + str(ec))
-            except Exception:
-                return True
-        print("[2fa] Fail: " + str(r.status_code))
-        return False
-
-    def handle_2fa_sms(self, dsid, idms_token):
-        print("[2fa-sms] Bat dau...")
-        headers = self._build_2fa_headers(dsid, idms_token)
-        phone_id = 1
-
-        try:
-            r = requests.get(
-                "https://gsa.apple.com/auth/verify/phone",
-                headers=headers, timeout=10, verify=False
-            )
-            if r.ok:
-                phones = r.json().get("trustedPhoneNumbers", [])
-                if phones:
-                    phone_id = phones[0].get("id", 1)
-        except Exception:
-            pass
-
-        sms_headers = self._build_2fa_headers(dsid, idms_token)
-        sms_headers["Content-Type"] = "application/json"
-        sms_body = {"phoneNumber": {"id": phone_id}, "mode": "sms"}
-
-        requests.put(
-            "https://gsa.apple.com/auth/verify/phone",
-            json=sms_body, headers=sms_headers, timeout=10, verify=False
-        )
-
-        code = self.input_func("[2fa-sms] Nhap ma OTP: ").strip()
-        if not code:
-            return False
-
-        vh = self._build_2fa_headers(dsid, idms_token)
-        vh["Content-Type"] = "application/json"
-        body = {"phoneNumber": {"id": phone_id}, "mode": "sms", "securityCode": {"code": code}}
-
-        r = requests.post(
-            "https://gsa.apple.com/auth/verify/phone/securitycode",
-            json=body, headers=vh, timeout=10, verify=False
-        )
-        if r.ok:
-            print("[2fa-sms] OK!")
+        result = subprocess.run(["pgrep", "-f", "usbmuxd"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                if pid:
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                        log_info(f"Đã kill usbmuxd PID {pid}")
+                    except:
+                        pass
+            time.sleep(1)
             return True
-        print("[2fa-sms] Fail: " + str(r.status_code))
+        return False
+    except Exception as e:
+        log_warn(f"Lỗi kill usbmuxd: {e}")
         return False
 
-    # --- APPTOKEN ---
-    def fetch_app_token(self, adsid, c, idms_token, sk, app="com.apple.gs.xcode.auth"):
-        print("[apptoken] Lay token cho '" + app + "'...")
+def check_usbmuxd():
+    """Kiểm tra usbmuxd có đang chạy không"""
+    try:
+        result = subprocess.run(["pgrep", "-f", "usbmuxd"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except:
+        return False
+
+# === ZSIGN ===
+def find_zsign():
+    if shutil.which("zsign"):
+        return shutil.which("zsign")
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zsign")
+    if os.path.exists(local):
+        return local
+    prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+    prefix_bin = os.path.join(prefix, "bin", "zsign")
+    if os.path.exists(prefix_bin):
+        return prefix_bin
+    home = os.path.expanduser("~/zsign/zsign")
+    if os.path.exists(home):
+        return home
+    work = os.path.expanduser("~/.sideload/zsign")
+    if os.path.exists(work):
+        return work
+    return None
+
+def check_zsign():
+    zsign = find_zsign()
+    if not zsign:
+        print("[zsign] ❌ Không tìm thấy zsign!")
+        print("[zsign] Cài bằng: pkg install zsign")
+        print("[zsign] Hoặc: https://github.com/zhlynn/zsign")
+        return False
+    try:
+        result = subprocess.run([zsign, "-v"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            print(f"[zsign] ✅ Tìm thấy: {zsign}")
+            return True
+    except:
+        pass
+    print(f"[zsign] ⚠️ Tìm thấy nhưng không hoạt động: {zsign}")
+    return False
+
+# === IPHONE STATUS ===
+def check_iphone_status():
+    try:
+        udid = device_link.get_udid_from_usb()
+        if not udid:
+            return "🔴 DISCONNECTED (hoặc usbmuxd chưa chạy)"
         try:
-            checksum_hmac = hmac.new(sk, digestmod=hashlib.sha256)
-            checksum_hmac.update(b"apptokens")
-            checksum_hmac.update(adsid.encode("utf-8"))
-            checksum_hmac.update(app.encode("utf-8"))
-            checksum = checksum_hmac.digest()
+            result = subprocess.run(["idevicepair", "validate"], capture_output=True, text=True, timeout=10)
+            if "SUCCESS" in result.stdout.upper() or result.returncode == 0:
+                return f"🟢 CONNECTED & TRUSTED (UDID: {udid[:8]}...)"
+            else:
+                return f"🟠 CONNECTED - UNTRUSTED / UNPAIRED (UDID: {udid[:8]}...)"
+        except:
+            return f"🟡 CONNECTED - Không xác định pairing (UDID: {udid[:8]}...)"
+    except:
+        return "🔴 DISCONNECTED"
 
-            response = self.gsa_request({
-                "u": adsid,
-                "app": [app],
-                "c": c,
-                "t": idms_token,
-                "checksum": checksum,
-                "o": "apptokens",
-            })
+# === USB DEVICES ===
+def list_usb_devices():
+    """Liệt kê tất cả thiết bị USB đang kết nối"""
+    log_info("Đang quét tất cả thiết bị USB...")
+    try:
+        result = subprocess.run(["termux-usb", "-l"], capture_output=True, text=True, timeout=10)
+        usb_devices = []
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if '/dev/bus/usb/' in line:
+                line = line.strip('"').strip("'")
+                parts = line.split()
+                if parts:
+                    path = parts[-1].strip('"').strip("'")
+                    usb_devices.append({
+                        "path": path,
+                        "info": line
+                    })
+        return usb_devices
+    except Exception as e:
+        log_error(f"Lỗi quét USB: {e}")
+        return []
 
-            encrypted_token = response.get("et")
-            if not encrypted_token:
-                print("[apptoken] Khong co 'et'")
-                return None
-
-            decrypted = self.decrypt_gcm(sk, encrypted_token)
-            token_plist = _safe_plist_loads(decrypted)
-            app_tokens = token_plist.get("t", {})
-            token_info = app_tokens.get(app)
-            if token_info and "token" in token_info:
-                print("[apptoken] OK!")
-                return token_info["token"]
-            return None
-        except Exception as e:
-            print("[apptoken] Loi: " + str(e))
-            return None
-
-    # --- AUTHENTICATE ---
-    def authenticate(self, apple_id, password, _depth=0):
+def show_usb_selection_menu():
+    """Hiển thị menu chọn thiết bị USB"""
+    log_step(0, "Chọn thiết bị USB")
+    usb_devices = list_usb_devices()
+    if not usb_devices:
+        log_error("Không tìm thấy thiết bị USB nào!")
+        log_warn("👉 Cắm iPhone qua cáp USB và mở khoá màn hình.")
+        return None
+    log_info(f"Tìm thấy {len(usb_devices)} thiết bị USB:")
+    print()
+    for i, usb in enumerate(usb_devices, 1):
+        path = usb["path"].strip('"').strip("'")
+        usb["path"] = path
+        parts = path.split('/')
+        bus = parts[-2] if len(parts) >= 2 else "?"
+        dev = parts[-1] if len(parts) >= 1 else "?"
+        print(f"  {C.BOLD}[{i}]{C.ENDC} {C.OKCYAN}{path}{C.ENDC}")
+        print(f"      {C.OKBLUE}Bus:{C.ENDC} {bus} | {C.OKBLUE}Device:{C.ENDC} {dev}")
+        print(f"      {C.OKBLUE}Info:{C.ENDC} {usb['info']}")
+        print()
+    choice = input(f"Chọn thiết bị (1-{len(usb_devices)}, Enter để chọn đầu tiên): ").strip()
+    if choice:
         try:
-            print("[auth] Bat dau: " + apple_id)
+            idx = int(choice) - 1
+            if 0 <= idx < len(usb_devices):
+                selected = usb_devices[idx]
+                path = selected["path"].strip('"').strip("'")
+                log_ok(f"Đã chọn: {path}")
+                return {"path": path, "info": selected.get("info", "")}
+            else:
+                log_error("Số không hợp lệ. Chọn thiết bị đầu tiên.")
+                path = usb_devices[0]["path"].strip('"').strip("'")
+                return {"path": path, "info": usb_devices[0].get("info", "")}
+        except:
+            log_error("Lựa chọn không hợp lệ. Chọn thiết bị đầu tiên.")
+            path = usb_devices[0]["path"].strip('"').strip("'")
+            return {"path": path, "info": usb_devices[0].get("info", "")}
+    else:
+        path = usb_devices[0]["path"].strip('"').strip("'")
+        log_ok(f"Đã chọn mặc định: {path}")
+        return {"path": path, "info": usb_devices[0].get("info", "")}
 
-            usr = srp.User(apple_id, bytes(), hash_alg=srp.SHA256, ng_type=srp.NG_2048)
-            _, A = usr.start_authentication()
+# === SETUP USB ===
+def setup_usb_connection():
+    """Chỉ chạy khi người dùng chọn mục Setup USB"""
+    log_step(0, "Thiết lập USB & USBMUXD")
+    
+    if not shutil.which("termux-usb"):
+        log_error("termux-usb không tìm thấy! Cài Termux:API")
+        log_info("Cài: pkg install termux-api")
+        return False
+    
+    kill_usbmuxd()
+    
+    selected_usb = show_usb_selection_menu()
+    if not selected_usb:
+        return False
+    
+    usb_path = selected_usb["path"].strip('"').strip("'")
+    
+    log_info(f"Sử dụng thiết bị: {usb_path}")
+    log_info("Đang xin quyền truy cập USB...")
+    subprocess.run(["termux-usb", "-r", usb_path], timeout=10)
+    log_ok("Đã gửi yêu cầu quyền. Bấm OK trên popup Android.")
+    
+    log_info("Đang chờ 5 giây để kiểm tra thiết bị...")
+    time.sleep(5)
+    
+    log_info("Đang khởi động usbmuxd...")
+    cmd = f'termux-usb -r -E -e "usbmuxd -f -p" "{usb_path}"'
+    log_info(f"Command: {cmd}")
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+    except Exception as e:
+        log_error(f"Lỗi khởi động usbmuxd: {e}")
+        return False
+    
+    log_info("Đang chờ usbmuxd khởi động...")
+    time.sleep(8)
+    
+    if check_usbmuxd():
+        log_ok("✅ usbmuxd đang chạy!")
+    else:
+        log_warn("⚠️ usbmuxd chưa chạy.")
+        log_info("👉 Thử chạy thủ công:")
+        log_info(f'   termux-usb -r -E -e "usbmuxd -f -p" "{usb_path}"')
+        kill_usbmuxd()
+        return False
+    
+    try:
+        udid = device_link.get_udid_from_usb()
+        if udid:
+            log_ok(f"✅ Thiết bị tìm thấy: {udid}")
+            return True
+    except:
+        pass
+    
+    log_warn("⚠️ Không thể kết nối tự động.")
+    log_info("Đang kill usbmuxd do kết nối thất bại...")
+    kill_usbmuxd()
+    log_info("👉 Chạy thủ công trong terminal khác:")
+    log_info(f'   termux-usb -r -E -e "usbmuxd -f -p" "{usb_path}"')
+    return False
 
-            response = self.gsa_request(
-                {"A2k": A, "ps": ["s2k", "s2k_fo"], "u": apple_id, "o": "init"}
-            )
-            if "sp" not in response:
-                print("[auth] Khong co SP")
-                print("[auth] Response: " + str(response)[:300])
-                return None
+# === TEST PAIRING ===
+def test_pairing():
+    """Test pairing với thiết bị"""
+    log_step(0, "Test Pairing")
+    udid = device_link.get_udid_from_usb()
+    if not udid:
+        log_error("Không tìm thấy thiết bị!")
+        log_warn("👉 Chạy 'Setup USB' trước.")
+        return False
+    log_info(f"UDID: {udid}")
+    log_info("STEP 1: Gửi yêu cầu pair...")
+    log_warn("👉 Kiểm tra iPhone: Bấm 'Trust' và nhập passcode nếu có.")
+    try:
+        output = subprocess.run(["idevicepair", "pair", udid], capture_output=True, text=True, timeout=60)
+        print(output.stdout)
+        print(output.stderr)
+    except subprocess.TimeoutExpired:
+        log_warn("Timeout khi pair.")
+        log_info("Đang kill usbmuxd do pair thất bại...")
+        kill_usbmuxd()
+        return False
+    except Exception as e:
+        log_error(f"Lỗi pair: {e}")
+        kill_usbmuxd()
+        return False
+    log_info("Waiting 5 giây...")
+    time.sleep(5)
+    log_info("STEP 2: Xác nhận pairing...")
+    try:
+        output2 = subprocess.run(["idevicepair", "pair", udid], capture_output=True, text=True, timeout=30)
+        print(output2.stdout)
+        print(output2.stderr)
+        if "SUCCESS" in output2.stdout.upper() or "paired" in output2.stdout.lower():
+            log_ok("🎉 Pairing thành công!")
+            return True
+        else:
+            log_warn("⚠️ Pairing chưa hoàn tất.")
+            log_info("Đang kill usbmuxd do pair thất bại...")
+            kill_usbmuxd()
+            return False
+    except Exception as e:
+        log_error(f"Lỗi confirm: {e}")
+        kill_usbmuxd()
+        return False
 
-            protocol = response["sp"]
-            salt = response["s"]
-            B = response["B"]
-            c = response["c"]
-            iterations = response["i"]
+# === PATCH BUNDLE ID ===
+def patch_bundle_ids(app_bundle_path, team_id):
+    """Đổi bundle ID: com.app.name.{teamid} và com.app.name.{teamid}.widget"""
+    original_bundle_id = utils.get_bundle_id(app_bundle_path)
+    original_bundle_id = clean_string(original_bundle_id)
+    
+    if not original_bundle_id:
+        raise Exception("Bundle ID gốc rỗng sau khi clean")
+    
+    new_bundle_id = f"{original_bundle_id}.{team_id}"
+    utils.set_bundle_id(app_bundle_path, new_bundle_id)
+    log_ok(f"[PATCH] App: {original_bundle_id} -> {new_bundle_id}")
+    
+    plugins_dir = os.path.join(app_bundle_path, "PlugIns")
+    if os.path.isdir(plugins_dir):
+        for item in os.listdir(plugins_dir):
+            if item.endswith(".appex"):
+                ext_plist = os.path.join(plugins_dir, item, "Info.plist")
+                if os.path.exists(ext_plist):
+                    with open(ext_plist, 'rb') as f:
+                        ext_data = plistlib.load(f)
+                    ext_original_id = clean_string(ext_data.get("CFBundleIdentifier", ""))
+                    
+                    if ext_original_id.startswith(original_bundle_id):
+                        ext_suffix = ext_original_id[len(original_bundle_id):]
+                        ext_new_id = f"{original_bundle_id}.{team_id}{ext_suffix}"
+                        ext_data["CFBundleIdentifier"] = ext_new_id
+                        with open(ext_plist, 'wb') as f:
+                            plistlib.dump(ext_data, f, fmt=plistlib.FMT_BINARY)
+                        log_ok(f"[PATCH] Extension: {ext_original_id} -> {ext_new_id}")
+    
+    return new_bundle_id
 
-            if isinstance(salt, str):
-                salt = base64.b64decode(salt)
-            if isinstance(B, str):
-                B = base64.b64decode(B)
+# === APP ID / PROVISIONING HELPERS ===
+def find_app_id(dev_api, bundle_id):
+    """Tìm Exact App ID theo bundle identifier."""
+    bundle_id = clean_string(bundle_id)
+    for app_id in dev_api.list_app_ids() or []:
+        identifier = clean_string(
+            app_id.get("identifier")
+            or app_id.get("bundleId")
+            or app_id.get("bundleID")
+            or ""
+        )
+        if identifier == bundle_id:
+            return app_id
+    return None
 
-            usr.p = self.encrypt_password(password, salt, iterations, protocol)
-            M = usr.process_challenge(salt, B)
-            if M is None:
-                print("[auth] M1 fail")
-                return None
 
-            response = self.gsa_request(
-                {"c": c, "M1": M, "u": apple_id, "o": "complete"}
-            )
+def get_app_id_identifier(app_id):
+    return clean_string(
+        app_id.get("identifier")
+        or app_id.get("bundleId")
+        or app_id.get("bundleID")
+        or ""
+    )
 
-            status = response.get("Status", {})
-            auth_type = status.get("au")
 
-            m2_verified = False
-            if "M2" in response:
-                try:
-                    usr.verify_session(response["M2"])
-                    m2_verified = usr.authenticated()
-                except Exception as e:
-                    print("[auth] M2 skip: " + str(e))
+def get_app_id_id(app_id):
+    return app_id.get("appIdId") or app_id.get("id")
 
-            if not getattr(usr, "K", None):
-                print("[auth] Khong co session key")
-                return None
-            print("[auth] Session key OK (len=" + str(len(usr.K)) + ")")
 
-            spd_data = {}
-            if "spd" in response:
-                try:
-                    decrypted_spd = self.decrypt_cbc(usr, response["spd"])
-                    spd_data = _safe_plist_loads(decrypted_spd)
-                    print("[auth] spd OK (" + str(len(spd_data)) + " keys)")
-                except Exception as e:
-                    print("[auth] SPD err: " + str(e))
+def create_or_get_app_id(dev_api, bundle_id, name):
+    """Tạo Exact App ID nếu chưa có, không tạo wildcard."""
+    existing = find_app_id(dev_api, bundle_id)
+    if existing:
+        log_ok(f"Dùng App ID có sẵn: {bundle_id}")
+        return existing
 
-            if auth_type in ["trustedDeviceSecondaryAuth", "secondaryAuth", "smsSecondaryAuth"]:
-                headers_dict = {k.lower(): v for k, v in response.get("_headers", {}).items()}
-                dsid = (spd_data.get("adsid") or spd_data.get("dsid")
-                        or status.get("dsid") or headers_dict.get("x-apple-dsid"))
-                idms_token = spd_data.get("GsIdmsToken") or spd_data.get("idmsToken") or status.get("idmsToken")
+    created = dev_api.create_app_id(bundle_id, name)
+    if not created:
+        log_error(f"Không tạo được App ID {bundle_id}: {dev_api.last_error}")
+        return None
 
-                if not dsid or not idms_token:
-                    print("[2fa] Thieu dsid/idms")
-                    return None
+    log_ok(f"Đã tạo App ID: {bundle_id}")
+    return created
 
-                if auth_type in ["trustedDeviceSecondaryAuth", "secondaryAuth"]:
-                    two_fa_ok = self.handle_2fa_trusted_device(dsid, idms_token)
-                    if not two_fa_ok:
-                        two_fa_ok = self.handle_2fa_sms(dsid, idms_token)
-                else:
-                    two_fa_ok = self.handle_2fa_sms(dsid, idms_token)
-                    if not two_fa_ok:
-                        two_fa_ok = self.handle_2fa_trusted_device(dsid, idms_token)
 
-                if not two_fa_ok:
-                    print("[2fa] Fail")
-                    return None
+def decode_provisioning_profile(profile):
+    if not profile:
+        return None
 
-                # ✅ RETRY LOGIN sau 2FA de lay session key MOI
-                if _depth >= 1:
-                    print("[2fa] Da retry roi, tiep tuc")
-                else:
-                    print("[2fa] OK, retry login de lay session key moi...")
-                    time.sleep(3)
-                    return self.authenticate(apple_id, password, _depth=_depth + 1)
+    encoded = (
+        profile.get("encodedProfile")
+        or profile.get("content")
+        or profile.get("profileContent")
+    )
+    if not encoded:
+        return None
 
-            dsid = spd_data.get("adsid") or spd_data.get("dsid") or response.get("dsid")
-            app_session_token = None
-            adsid = spd_data.get("adsid") or dsid
-            c2 = spd_data.get("c")
-            sk = spd_data.get("sk")
-            idms = spd_data.get("GsIdmsToken")
+    try:
+        data = utils.decode_apple_data_field(encoded)
+        return data if data else None
+    except Exception as e:
+        log_error(f"Không decode được provisioning profile: {e}")
+        return None
 
-            if adsid and c2 and sk and idms:
-                app_session_token = self.fetch_app_token(adsid, c2, idms, sk)
 
-            try:
-                ck_dict = dict(self.session.cookies)
-                if ck_dict:
-                    save_cookies_encrypted(ck_dict, password)
-            except Exception as e:
-                print("[cookie] Skip: " + str(e))
+def download_profile_for_app(dev_api, app_id, bundle_id):
+    """Tải profile riêng cho đúng App ID."""
+    app_id_id = get_app_id_id(app_id)
+    if not app_id_id:
+        log_error(f"App ID {bundle_id} không có ID nội bộ.")
+        return None
 
-            return {
-                "user_id": apple_id,
-                "authenticated": True,
-                "dsid": dsid,
-                "session_token": app_session_token or spd_data.get("GsIdmsToken") or status.get("idmsToken"),
-                "m2": response.get("M2"),
-                "srp_user": usr,
-            }
+    profile = dev_api.download_provisioning_profile(app_id_id)
+    content = decode_provisioning_profile(profile)
 
+    if not content:
+        log_error(f"Không tải được provisioning profile cho {bundle_id}.")
+        return None
+
+    return content
+
+
+def write_embedded_profile(bundle_path, profile_content):
+    profile_path = os.path.join(bundle_path, "embedded.mobileprovision")
+    with open(profile_path, "wb") as f:
+        f.write(profile_content)
+    return profile_path
+
+
+def get_extension_bundles(app_bundle):
+    """Trả về [(appex_path, bundle_id)] sau khi Bundle ID đã được patch."""
+    result = []
+    plugins_dir = os.path.join(app_bundle, "PlugIns")
+
+    if not os.path.isdir(plugins_dir):
+        return result
+
+    for item in sorted(os.listdir(plugins_dir)):
+        if not item.endswith(".appex"):
+            continue
+
+        appex_path = os.path.join(plugins_dir, item)
+        plist_path = os.path.join(appex_path, "Info.plist")
+
+        if not os.path.isfile(plist_path):
+            continue
+
+        try:
+            with open(plist_path, "rb") as f:
+                data = plistlib.load(f)
+            bundle_id = clean_string(data.get("CFBundleIdentifier", ""))
+            if bundle_id:
+                result.append((appex_path, bundle_id))
         except Exception as e:
-            print("[auth] Loi: " + str(e))
-            traceback.print_exc()
+            log_warn(f"Không đọc được Info.plist của {item}: {e}")
+
+    return result
+
+
+def get_certificate_team_id(cert_path):
+    """Lấy Team ID thật từ OU trong certificate PEM."""
+    try:
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+
+        from cryptography.x509.oid import NameOID
+
+        values = cert.subject.get_attributes_for_oid(
+            NameOID.ORGANIZATIONAL_UNIT_NAME
+        )
+        for attr in values:
+            value = clean_string(attr.value)
+            if re.fullmatch(r"[A-Z0-9]{10}", value):
+                return value
+
+        # Một số certificate có thể có nhiều trường subject khác nhau.
+        for attr in cert.subject:
+            value = clean_string(attr.value)
+            if re.fullmatch(r"[A-Z0-9]{10}", value):
+                return value
+
+    except Exception as e:
+        log_warn(f"Không đọc được Team ID từ certificate: {e}")
+
+    return None
+
+
+def prepare_provisioning(dev_api, app_bundle, app_name, team_id):
+    """
+    Mỗi bundle (app + từng .appex) có:
+      1. Exact App ID riêng
+      2. provisioning profile riêng
+      3. embedded.mobileprovision riêng
+
+    Trả về danh sách profile theo thứ tự main app -> extensions.
+    """
+    profiles = []
+
+    # Main app
+    main_bundle_id = clean_string(utils.get_bundle_id(app_bundle))
+    if not main_bundle_id:
+        log_error("Main Bundle ID rỗng.")
+        return None
+
+    main_app_id = create_or_get_app_id(
+        dev_api, main_bundle_id, app_name
+    )
+    if not main_app_id:
+        return None
+
+    main_profile = download_profile_for_app(
+        dev_api, main_app_id, main_bundle_id
+    )
+    if not main_profile:
+        return None
+
+    main_profile_path = write_embedded_profile(app_bundle, main_profile)
+    profiles.append((app_bundle, main_bundle_id, main_profile_path))
+    log_ok(f"Profile riêng cho App: {main_bundle_id}")
+
+    # Extensions
+    for appex_path, ext_bundle_id in get_extension_bundles(app_bundle):
+        ext_name = clean_string(
+            os.path.basename(appex_path).removesuffix(".appex")
+        ) or f"{app_name} Extension"
+
+        log_info(f"Xử lý Extension: {ext_bundle_id}")
+
+        ext_app_id = create_or_get_app_id(
+            dev_api, ext_bundle_id, ext_name
+        )
+        if not ext_app_id:
             return None
 
+        ext_profile = download_profile_for_app(
+            dev_api, ext_app_id, ext_bundle_id
+        )
+        if not ext_profile:
+            return None
+
+        ext_profile_path = write_embedded_profile(
+            appex_path, ext_profile
+        )
+        profiles.append(
+            (appex_path, ext_bundle_id, ext_profile_path)
+        )
+        log_ok(f"Profile riêng cho Extension: {ext_bundle_id}")
+
+    return profiles
+
+
+# === DO SIDELOAD ===
+def do_sideload(ipa_path, apple_id, password):
+    """Sideload với Team ID thật + profile riêng cho từng bundle."""
+    log_step(1, "Xác thực Apple ID")
+
+    if not check_usbmuxd():
+        log_error("usbmuxd chưa chạy! Chạy 'Setup USB' trước.")
+        return False
+
+    udid = device_link.get_udid_from_usb()
+    if not udid:
+        log_error("Không tìm thấy thiết bị! Chạy 'Setup USB' trước.")
+        kill_usbmuxd()
+        return False
+    log_ok(f"UDID: {udid}")
+
+    try:
+        import requests
+        requests.get("https://www.apple.com", timeout=5)
+        log_ok("Có kết nối internet")
+    except Exception:
+        log_error("Không có kết nối internet!")
+        return False
+
+    auth = AppleAuth(input_func=input)
+    auth_result = auth.authenticate(apple_id, password)
+
+    if not auth_result or not auth_result.get("authenticated"):
+        log_error("Xác thực thất bại.")
+        return False
+
+    if auth_result.get("authenticated") == "2fa_completed":
+        log_warn("2FA hoàn tất. Hãy chạy lại.")
+        return False
+
+    config.set_apple_id(apple_id)
+    if config.get_password() != password:
+        config.save_password(password)
+    log_ok("Đã lưu thông tin đăng nhập.")
+
+    dsid = auth_result["dsid"]
+    session_token = auth_result["session_token"]
+    dev_api = DeveloperAPI(auth, dsid, session_token)
+
+    log_step(2, "Lấy Team ID thật từ Apple Developer")
+    teams = dev_api.list_teams()
+    if not teams:
+        log_error("Không lấy được Team ID. Kiểm tra tài khoản Developer.")
+        return False
+
+    team_id = clean_string(
+        teams[0].get("teamId")
+        or teams[0].get("teamID")
+        or teams[0].get("id")
+        or ""
+    )
+
+    if not re.fullmatch(r"[A-Z0-9]{10}", team_id):
+        log_error(f"Team ID Apple trả về không hợp lệ: {team_id!r}")
+        return False
+
+    dev_api.set_team(team_id)
+    log_ok(f"Team ID thật: {team_id}")
+
+    log_step(3, "Kiểm tra thiết bị trên Apple")
+    devices = dev_api.list_devices() or []
+
+    if not any(
+        clean_string(d.get("deviceNumber") or d.get("udid") or "") == udid
+        for d in devices
+    ):
+        log_info("Thiết bị chưa đăng ký. Đang đăng ký...")
+        if not dev_api.register_device(f"iPhone-{udid[:8]}", udid):
+            log_error(f"Đăng ký thiết bị thất bại: {dev_api.last_error}")
+            return False
+        log_ok("Đã đăng ký thiết bị.")
+
+    log_step(4, "Chuẩn bị Certificate")
+    cert_pem_path = os.path.join(WORK_DIR, "cert.pem")
+    key_pem_path = os.path.join(WORK_DIR, "key.pem")
+
+    cert_exists = os.path.isfile(cert_pem_path)
+    key_exists = os.path.isfile(key_pem_path)
+
+    if cert_exists != key_exists:
+        log_error(
+            "cert.pem và key.pem không đồng bộ. "
+            "Xoá/copy lại đúng cặp certificate + private key."
+        )
+        return False
+
+    if not cert_exists:
+        log_info("Chưa có certificate local. Đang tạo certificate mới...")
+        cert_data = dev_api.create_certificate(
+            f"sideload-{uuid.uuid4().hex[:8]}"
+        )
+
+        if not cert_data:
+            log_error(
+                f"Không tạo được certificate: {dev_api.last_error}"
+            )
+            return False
+
+        cert_content = (
+            cert_data.get("attributes", {}).get("certificateContent")
+            or cert_data.get("certContent")
+        )
+        key_pem = cert_data.get("_private_key_pem")
+
+        if not cert_content or not key_pem:
+            log_error("Apple không trả đủ certificate/private key.")
+            return False
+
+        utils.save_certificate_as_pem(
+            cert_content, cert_pem_path
+        )
+
+        with open(key_pem_path, "w", encoding="utf-8") as f:
+            f.write(key_pem)
+
+        log_ok("Đã tạo certificate mới.")
+    else:
+        log_ok("Dùng certificate + private key có sẵn.")
+
+    # Tuyệt đối không tự revoke certificate cũ.
+    cert_team_id = get_certificate_team_id(cert_pem_path)
+
+    if not cert_team_id:
+        log_error(
+            "Không xác định được Team ID trong cert.pem. "
+            "Không tiếp tục ký để tránh ký sai team."
+        )
+        return False
+
+    log_info(f"Team ID trong certificate: {cert_team_id}")
+
+    if cert_team_id != team_id:
+        log_error(
+            f"Certificate Team ID ({cert_team_id}) khác "
+            f"Developer Team ID ({team_id})."
+        )
+        log_error(
+            "Hãy dùng đúng cặp cert.pem + key.pem của Team này."
+        )
+        return False
+
+    log_ok("Certificate Team ID khớp Developer Team.")
+
+    log_step(5, "Extract IPA & đổi Bundle ID")
+    work_dir = os.path.join(WORK_DIR, "extract")
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+
+    utils.extract_ipa(ipa_path, work_dir)
+
+    app_bundle = utils.find_app_bundle(work_dir)
+    if not app_bundle:
+        log_error("Không tìm thấy .app trong IPA.")
+        return False
+
+    original_bundle_id = clean_string(
+        utils.get_bundle_id(app_bundle)
+    )
+    app_name = clean_string(utils.get_app_name(app_bundle))
+
+    if not original_bundle_id:
+        log_error("IPA không có CFBundleIdentifier.")
+        return False
+
+    log_info(
+        f"App: {app_name} | Bundle ID gốc: {original_bundle_id}"
+    )
+
+    bundle_id = patch_bundle_ids(app_bundle, team_id)
+    log_ok(f"Bundle ID mới: {bundle_id}")
+
+    log_step(6, "Tạo App ID & Provisioning Profile riêng")
+
+    profiles = prepare_provisioning(
+        dev_api,
+        app_bundle,
+        app_name,
+        team_id
+    )
+
+    if not profiles:
+        log_error("Chuẩn bị provisioning profile thất bại.")
+        return False
+
+    log_ok(
+        f"Đã chuẩn bị {len(profiles)} provisioning profile "
+        f"(App + Extension)."
+    )
+
+    log_step(7, "Ký IPA bằng zsign")
+
+    if not check_zsign():
+        return False
+
+    zsign_path = find_zsign()
+    if not zsign_path:
+        return False
+
+    signed_ipa = os.path.join(
+        WORK_DIR, f"{app_name}_signed.ipa"
+    )
+    tmp_dir = os.path.join(WORK_DIR, "zsign_tmp")
+
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    # zsign hỗ trợ nhiều -m: main app + từng extension.
+    zsign_cmd = [
+        zsign_path,
+        "-f",
+        "-t", tmp_dir,
+        "-c", cert_pem_path,
+        "-k", key_pem_path,
+    ]
+
+    for bundle_path, bundle_id, profile_path in profiles:
+        if not os.path.isfile(profile_path):
+            log_error(
+                f"Thiếu provisioning profile: {profile_path}"
+            )
+            return False
+        zsign_cmd.extend(["-m", profile_path])
+        log_info(f"[ZSIGN] -m {bundle_id}")
+
+    zsign_cmd.extend([
+        "-o", signed_ipa,
+        app_bundle
+    ])
+
+    try:
+        utils.run_command(zsign_cmd)
+    except Exception as e:
+        log_error(f"Ký IPA thất bại: {e}")
+        return False
+
+    if not os.path.isfile(signed_ipa):
+        log_error("zsign không tạo ra IPA đầu ra.")
+        return False
+
+    log_ok(f"Đã ký IPA: {signed_ipa}")
+
+    log_step(8, "Pairing & Cài đặt")
+
+    pair = device_link.pair_device(udid)
+    if not pair:
+        log_error("Pairing thất bại.")
+        log_info("Đang kill usbmuxd do pairing thất bại...")
+        kill_usbmuxd()
+        return False
+
+    log_ok("Pairing thành công.")
+
+    try:
+        installed = device_link.install_ipa(pair, signed_ipa)
+        if not installed:
+            raise RuntimeError("ideviceinstaller trả về thất bại")
+
+        log_ok("🎉 Cài đặt thành công!")
+        return True
+
+    except Exception as e:
+        log_error(f"Cài đặt thất bại: {e}")
+        log_info("Đang kill usbmuxd do cài đặt thất bại...")
+        kill_usbmuxd()
+        return False
+
+
+# === REVOKE CERTS ===
+def do_revoke_certs(apple_id, password):
+    log_step(1, "Xác thực")
+    auth = AppleAuth(input_func=input)
+    auth_result = auth.authenticate(apple_id, password)
+    
+    if not auth_result or not auth_result.get("authenticated"):
+        log_error("Xác thực thất bại.")
+        return False
+    if auth_result.get("authenticated") == "2fa_completed":
+        log_warn("2FA hoàn tất. Chạy lại.")
+        return False
+    
+    dsid = auth_result["dsid"]
+    session_token = auth_result["session_token"]
+    dev_api = DeveloperAPI(auth, dsid, session_token)
+    
+    teams = dev_api.list_teams()
+    if not teams:
+        log_error("Không có team.")
+        return False
+    team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
+    dev_api.set_team(team_id)
+    
+    certs = dev_api.list_certificates()
+    if not certs:
+        log_info("Không có certificate nào.")
+        return True
+    
+    log_info(f"Có {len(certs)} certificate:")
+    for i, cert in enumerate(certs, 1):
+        attrs = cert.get("attributes", {})
+        print(f"  [{i}] id={cert.get('id')} name={attrs.get('name')} exp={attrs.get('expirationDate')}")
+    
+    selector = input("Chọn certificate cần thu hồi (số hoặc 'all'): ").strip().lower()
+    if selector == "all":
+        targets = certs
+    else:
+        try:
+            idx = int(selector) - 1
+            targets = [certs[idx]] if 0 <= idx < len(certs) else []
+        except:
+            targets = []
+        if not targets:
+            log_error("Chọn không hợp lệ.")
+            return False
+    
+    for cert in targets:
+        ok = dev_api.revoke_certificate(cert.get("id"))
+        log_ok(f"Revoke {cert.get('id')} {'thành công' if ok else 'thất bại'}")
+    return True
+
+# === MAIN ===
+def main():
+    print(f"{C.BOLD}{C.HEADER}╔══════════════════════════════════════════╗{C.ENDC}")
+    print(f"{C.BOLD}{C.HEADER}║     iOS Sideload Tool for Termux        ║{C.ENDC}")
+    print(f"{C.BOLD}{C.HEADER}╚══════════════════════════════════════════╝{C.ENDC}")
+    print()
+    print(f"{C.OKCYAN}📱 iPhone Status:{C.ENDC} {check_iphone_status()}")
+    
+    print()
+    
+    saved_id = config.get_apple_id()
+    saved_pass = config.get_password()
+    
+    print("1. Sideload IPA")
+    print("2. Thu hồi cert")
+    print("3. Setup USB & USBMUXD")
+    print("4. Test Pairing")
+    print("5. Thoát")
+    choice = input("Chọn (1-5): ").strip()
+    
+    if choice == "1":
+        if not check_usbmuxd():
+            log_error("usbmuxd chưa chạy! Chạy 'Setup USB' (mục 3) trước.")
+            main()
+            return
+        
+        udid = device_link.get_udid_from_usb()
+        if not udid:
+            log_error("Không tìm thấy thiết bị! Chạy 'Setup USB' (mục 3) trước.")
+            main()
+            return
+        
+        ipa = input("Đường dẫn IPA: ").strip()
+        ipa = os.path.expanduser(ipa)
+        ipa = os.path.abspath(ipa)
+        
+        if not os.path.exists(ipa):
+            log_error(f"File IPA không tồn tại: {ipa}")
+            return
+        
+        if saved_id:
+            print(f"{C.OKCYAN}Apple ID đã lưu:{C.ENDC} {saved_id}")
+            if input("Dùng? (y/n): ").lower() == "y":
+                apple_id = saved_id
+            else:
+                apple_id = input("Apple ID: ").strip()
+                config.set_apple_id(apple_id)
+        else:
+            apple_id = input("Apple ID: ").strip()
+            config.set_apple_id(apple_id)
+        
+        if saved_pass and apple_id == saved_id:
+            if input("Dùng mật khẩu đã lưu? (y/n): ").lower() == "y":
+                password = saved_pass
+            else:
+                password = getpass.getpass("Mật khẩu: ")
+                config.save_password(password)
+        else:
+            password = getpass.getpass("Mật khẩu: ")
+            config.save_password(password)
+        
+        do_sideload(ipa, apple_id, password)
+    
+    elif choice == "2":
+        if saved_id:
+            print(f"{C.OKCYAN}Apple ID đã lưu:{C.ENDC} {saved_id}")
+            if input("Dùng? (y/n): ").lower() == "y":
+                apple_id = saved_id
+            else:
+                apple_id = input("Apple ID: ").strip()
+                config.set_apple_id(apple_id)
+        else:
+            apple_id = input("Apple ID: ").strip()
+            config.set_apple_id(apple_id)
+        
+        if saved_pass and apple_id == saved_id:
+            if input("Dùng mật khẩu đã lưu? (y/n): ").lower() == "y":
+                password = saved_pass
+            else:
+                password = getpass.getpass("Mật khẩu: ")
+                config.save_password(password)
+        else:
+            password = getpass.getpass("Mật khẩu: ")
+            config.save_password(password)
+        
+        do_revoke_certs(apple_id, password)
+    
+    elif choice == "3":
+        setup_usb_connection()
+        main()
+    
+    elif choice == "4":
+        test_pairing()
+        main()
+    
+    elif choice == "5":
+        print("Đã thoát.")
+        sys.exit(0)
+
+    else:
+        print("Lựa chọn không hợp lệ.")
+        main()
 
 if __name__ == "__main__":
-    import getpass
-    print("=== APPLE AUTH ===")
-    aid = input("Apple ID: ").strip()
-    pw = getpass.getpass("Password: ")
-    if not aid or not pw:
-        exit(1)
-    auth = AppleAuth()
-    result = auth.authenticate(aid, pw)
-    print()
-    if result and result.get("authenticated"):
-        print("*** THANH CONG! ***")
-        print("  DSID: " + str(result.get("dsid")))
-    else:
-        print("*** THAT BAI ***")
-
-
-# === BACKWARD COMPAT ===
-def fetch_official_servers(anisette_url=None):
-    """Wrapper cho main.py cũ."""
-    return [ANISETTE_URL]
-
-
-# === BACKWARD COMPAT CHO DeveloperAPI ===
-
-def fetch_official_servers(anisette_url=None):
-    """Wrapper cho main.py cu."""
-    return [ANISETTE_URL]
-
-
-def _get_auth_instance(self):
-    """Helper: tra ve chinh no (dung cho DeveloperAPI)."""
-    return self
-
-
-# Them method vao class AppleAuth
-def generate_anisette_headers(self):
-    """Wrapper cho DeveloperAPI cu."""
-    return self.get_ani() or {}
-
-
-def generate_meta_headers_compat(self):
-    """Wrapper cho DeveloperAPI cu."""
-    return self.generate_meta_headers()
-
-
-# Bind method vao class
-AppleAuth.generate_anisette_headers = generate_anisette_headers
-AppleAuth.generate_meta_headers_compat = generate_meta_headers_compat
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nĐã hủy.")
+        kill_usbmuxd()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Lỗi: {e}")
+        kill_usbmuxd()
+        sys.exit(1)
