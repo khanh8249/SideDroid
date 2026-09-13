@@ -36,7 +36,11 @@ COOKIE_PATH = os.path.expanduser("~/.sideload/cookies.enc")
 def fix_client_info(ci):
     if not ci:
         return "<MacBookPro18,3> <Mac OS X;26.5.2> <com.apple.AuthKit/1 (com.apple.akd/1)>"
-    return re.sub(r"com[.]apple[.]dt[.]Xcode/[\d.]+", "com.apple.akd/1", ci)
+    # Xoa MOI thu chua 'com.apple.dt.Xcode' (ke ca khong co version)
+    ci = re.sub(r"\(com\.apple\.dt\.Xcode[^)]*\)", "(com.apple.akd/1.0)", ci)
+    if "com.apple.dt.Xcode" in ci:
+        ci = ci.replace("com.apple.dt.Xcode", "com.apple.akd")
+    return ci
 
 
 def _safe_plist_loads(data):
@@ -167,10 +171,12 @@ class AppleAuth:
             "X-Apple-I-SRL-NO": "0",
         }
 
-    def generate_cpd(self):
-        # Cache anisette 1 lan duy nhat
-        if self._cached_ani is None:
-            self._cached_ani = self.get_ani()
+    def generate_cpd(self, force_refresh=False):
+        # Cache anisette, force refresh neu can
+        if force_refresh or self._cached_ani is None:
+            fresh = self.get_ani()
+            if fresh:
+                self._cached_ani = fresh
         anisette = self._cached_ani
         if not anisette:
             return None
@@ -239,8 +245,9 @@ class AppleAuth:
         # Apptokens: chi thu 1 lan
         if parameters.get("o") == "apptokens":
             max_retries = 1
+        op = parameters.get("o", "?")
         for attempt in range(max_retries):
-            cpd_data = self.generate_cpd()
+            cpd_data = self.generate_cpd(force_refresh=(op == "apptokens"))
             if not cpd_data:
                 print("[gsa] Khong lay duoc cpd")
                 time.sleep(2)
@@ -265,6 +272,7 @@ class AppleAuth:
                 session = requests.Session()
                 session.verify = False
                 session.trust_env = False
+                session.headers.clear()
                 session.headers.update(headers)
 
                 response = session.post(
@@ -304,6 +312,8 @@ class AppleAuth:
                 ec = st.get("ec", 0)
                 if ec != 0:
                     print("[gsa] ec=" + str(ec) + " em=" + st.get("em", "?"))
+                    if st.get("X-Apple-I-MD-Cmd-Target"):
+                        print("[gsa] Cmd-Target=" + str(st.get("X-Apple-I-MD-Cmd-Target")))
                 else:
                     print("[gsa] OK")
 
