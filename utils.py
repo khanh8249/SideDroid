@@ -25,16 +25,48 @@ def run_command(command, cwd=None, extra_env=None):
         if e.stderr:
             print(f"--- stderr ---\n{e.stderr}")
         raise
-
+        
 def extract_ipa(ipa_path, output_dir):
     print(f"[IPA] Giải nén {ipa_path} vào {output_dir}...")
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
-    os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    
     with zipfile.ZipFile(ipa_path, 'r') as zip_ref:
-        zip_ref.extractall(output_dir)
-    print("[IPA] Giải nén xong.")
+        for info in zip_ref.infolist():
+            # 1. Xác định đường dẫn giải nén tuyệt đối an toàn
+            extracted_path = os.path.join(output_dir, info.filename)
+            
+            # Tạo thư mục cha nếu chưa có
+            os.makedirs(os.path.dirname(extracted_path), exist_ok=True)
+            
+            # Kiểm tra xem file trong ZIP có phải là Thư mục không
+            if info.is_dir():
+                os.makedirs(extracted_path, exist_ok=True)
+                continue
+                
+            # 2. Xử lý Symlink (Kiểm tra bit thuộc tính Unix của Symlink)
+            # Mã hex 0xA0000000 đại diện cho S_IFLNK (Symbolic Link)
+            if (info.external_attr >> 28) == 0xA:
+                # Đọc nội dung text bên trong file zip (chính là đường dẫn đích của symlink)
+                link_target = zip_ref.read(info).decode('utf-8').strip()
+                if os.path.exists(extracted_path) or os.path.islink(extracted_path):
+                    os.unlink(extracted_path)
+                os.symlink(link_target, extracted_path)
+            else:
+                # 3. Giải nén file thường
+                with zip_ref.open(info) as source, open(extracted_path, 'wb') as target:
+                    shutil.copyfileobj(source, target)
+                
+                # 4. Phục hồi quyền hạn POSIX gốc (như quyền thực thi +x)
+                # Trích xuất 16-bit quyền hệ thống từ external_attr
+                unix_attributes = info.external_attr >> 16
+                if unix_attributes != 0:
+                    os.chmod(extracted_path, unix_attributes & 0o777)
+                    
+    print("[IPA] Giải nén xong và giữ nguyên cấu trúc iOS.")
     return output_dir
+
 
 def find_app_bundle(extracted_ipa_path):
     payload_path = os.path.join(extracted_ipa_path, "Payload")
