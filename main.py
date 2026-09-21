@@ -43,7 +43,6 @@ def log_step(step, msg): print(f"\n{C.BOLD}{C.HEADER}── Bước {step} ─�
 
 # === HELPER: LÀM SẠCH STRING ===
 def clean_string(s):
-    """Loại bỏ ký tự điều khiển và đảm bảo là string hợp lệ"""
     if s is None:
         return ""
     if isinstance(s, bytes):
@@ -54,7 +53,6 @@ def clean_string(s):
 
 # === KILL USBMUXD ===
 def kill_usbmuxd():
-    """Kill tất cả tiến trình usbmuxd đang chạy"""
     try:
         result = subprocess.run(["pgrep", "-f", "usbmuxd"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
@@ -74,7 +72,6 @@ def kill_usbmuxd():
         return False
 
 def check_usbmuxd():
-    """Kiểm tra usbmuxd có đang chạy không"""
     try:
         result = subprocess.run(["pgrep", "-f", "usbmuxd"], capture_output=True, timeout=5)
         return result.returncode == 0
@@ -105,7 +102,6 @@ def check_zsign():
     if not zsign:
         print("[zsign] ❌ Không tìm thấy zsign!")
         print("[zsign] Cài bằng: pkg install zsign")
-        print("[zsign] Hoặc: https://github.com/zhlynn/zsign")
         return False
     try:
         result = subprocess.run([zsign, "-v"], capture_output=True, text=True, timeout=5)
@@ -116,6 +112,22 @@ def check_zsign():
         pass
     print(f"[zsign] ⚠️ Tìm thấy nhưng không hoạt động: {zsign}")
     return False
+
+# === VERIFY SIGNATURE ===
+def verify_signed_bundle(app_bundle):
+    """Kiểm tra _CodeSignature/CodeResources tồn tại và đọc được."""
+    cs = os.path.join(app_bundle, "_CodeSignature", "CodeResources")
+    if not os.path.isfile(cs):
+        log_error(f"Thiếu _CodeSignature/CodeResources trong {app_bundle}")
+        return False
+    try:
+        with open(cs, "rb") as f:
+            plistlib.load(f)
+    except Exception as e:
+        log_error(f"CodeResources hỏng: {e}")
+        return False
+    log_ok("CodeResources hợp lệ.")
+    return True
 
 # === IPHONE STATUS ===
 def check_iphone_status():
@@ -136,7 +148,6 @@ def check_iphone_status():
 
 # === USB DEVICES ===
 def list_usb_devices():
-    """Liệt kê tất cả thiết bị USB đang kết nối"""
     log_info("Đang quét tất cả thiết bị USB...")
     try:
         result = subprocess.run(["termux-usb", "-l"], capture_output=True, text=True, timeout=10)
@@ -148,17 +159,13 @@ def list_usb_devices():
                 parts = line.split()
                 if parts:
                     path = parts[-1].strip('"').strip("'")
-                    usb_devices.append({
-                        "path": path,
-                        "info": line
-                    })
+                    usb_devices.append({"path": path, "info": line})
         return usb_devices
     except Exception as e:
         log_error(f"Lỗi quét USB: {e}")
         return []
 
 def show_usb_selection_menu():
-    """Hiển thị menu chọn thiết bị USB"""
     log_step(0, "Chọn thiết bị USB")
     usb_devices = list_usb_devices()
     if not usb_devices:
@@ -201,49 +208,33 @@ def show_usb_selection_menu():
 
 # === SETUP USB ===
 def setup_usb_connection():
-    """Chỉ chạy khi người dùng chọn mục Setup USB"""
     log_step(0, "Thiết lập USB & USBMUXD")
-    
     if not shutil.which("termux-usb"):
         log_error("termux-usb không tìm thấy! Cài Termux:API")
         log_info("Cài: pkg install termux-api")
         return False
-    
     kill_usbmuxd()
-    
     selected_usb = show_usb_selection_menu()
     if not selected_usb:
         return False
-    
     usb_path = selected_usb["path"].strip('"').strip("'")
-    
     log_info(f"Sử dụng thiết bị: {usb_path}")
     log_info("Đang xin quyền truy cập USB...")
     subprocess.run(["termux-usb", "-r", usb_path], timeout=10)
     log_ok("Đã gửi yêu cầu quyền. Bấm OK trên popup Android.")
-    
     log_info("Đang chờ 5 giây để kiểm tra thiết bị...")
     time.sleep(5)
-    
     log_info("Đang khởi động usbmuxd...")
     cmd = f'termux-usb -r -E -e "usbmuxd -f -p" "{usb_path}"'
     log_info(f"Command: {cmd}")
-    
     try:
-        process = subprocess.Popen(
-            cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
-        )
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, preexec_fn=os.setsid)
     except Exception as e:
         log_error(f"Lỗi khởi động usbmuxd: {e}")
         return False
-    
     log_info("Đang chờ usbmuxd khởi động...")
     time.sleep(8)
-    
     if check_usbmuxd():
         log_ok("✅ usbmuxd đang chạy!")
     else:
@@ -252,7 +243,6 @@ def setup_usb_connection():
         log_info(f'   termux-usb -r -E -e "usbmuxd -f -p" "{usb_path}"')
         kill_usbmuxd()
         return False
-    
     try:
         udid = device_link.get_udid_from_usb()
         if udid:
@@ -260,17 +250,12 @@ def setup_usb_connection():
             return True
     except:
         pass
-    
     log_warn("⚠️ Không thể kết nối tự động.")
-    log_info("Đang kill usbmuxd do kết nối thất bại...")
     kill_usbmuxd()
-    log_info("👉 Chạy thủ công trong terminal khác:")
-    log_info(f'   termux-usb -r -E -e "usbmuxd -f -p" "{usb_path}"')
     return False
 
 # === TEST PAIRING ===
 def test_pairing():
-    """Test pairing với thiết bị"""
     log_step(0, "Test Pairing")
     udid = device_link.get_udid_from_usb()
     if not udid:
@@ -286,7 +271,6 @@ def test_pairing():
         print(output.stderr)
     except subprocess.TimeoutExpired:
         log_warn("Timeout khi pair.")
-        log_info("Đang kill usbmuxd do pair thất bại...")
         kill_usbmuxd()
         return False
     except Exception as e:
@@ -305,7 +289,6 @@ def test_pairing():
             return True
         else:
             log_warn("⚠️ Pairing chưa hoàn tất.")
-            log_info("Đang kill usbmuxd do pair thất bại...")
             kill_usbmuxd()
             return False
     except Exception as e:
@@ -315,17 +298,14 @@ def test_pairing():
 
 # === PATCH BUNDLE ID ===
 def patch_bundle_ids(app_bundle_path, team_id):
-    """Đổi bundle ID: com.app.name.{teamid} và com.app.name.{teamid}.widget"""
     original_bundle_id = utils.get_bundle_id(app_bundle_path)
     original_bundle_id = clean_string(original_bundle_id)
-    
     if not original_bundle_id:
         raise Exception("Bundle ID gốc rỗng sau khi clean")
-    
     new_bundle_id = f"{original_bundle_id}.{team_id}"
     utils.set_bundle_id(app_bundle_path, new_bundle_id)
     log_ok(f"[PATCH] App: {original_bundle_id} -> {new_bundle_id}")
-    
+
     plugins_dir = os.path.join(app_bundle_path, "PlugIns")
     if os.path.isdir(plugins_dir):
         for item in os.listdir(plugins_dir):
@@ -335,7 +315,6 @@ def patch_bundle_ids(app_bundle_path, team_id):
                     with open(ext_plist, 'rb') as f:
                         ext_data = plistlib.load(f)
                     ext_original_id = clean_string(ext_data.get("CFBundleIdentifier", ""))
-                    
                     if ext_original_id.startswith(original_bundle_id):
                         ext_suffix = ext_original_id[len(original_bundle_id):]
                         ext_new_id = f"{original_bundle_id}.{team_id}{ext_suffix}"
@@ -343,66 +322,47 @@ def patch_bundle_ids(app_bundle_path, team_id):
                         with open(ext_plist, 'wb') as f:
                             plistlib.dump(ext_data, f, fmt=plistlib.FMT_BINARY)
                         log_ok(f"[PATCH] Extension: {ext_original_id} -> {ext_new_id}")
-    
     return new_bundle_id
 
 # === APP ID / PROVISIONING HELPERS ===
 def find_app_id(dev_api, bundle_id):
-    """Tìm Exact App ID theo bundle identifier."""
     bundle_id = clean_string(bundle_id)
     for app_id in dev_api.list_app_ids() or []:
         identifier = clean_string(
-            app_id.get("identifier")
-            or app_id.get("bundleId")
-            or app_id.get("bundleID")
-            or ""
+            app_id.get("identifier") or app_id.get("bundleId") or app_id.get("bundleID") or ""
         )
         if identifier == bundle_id:
             return app_id
     return None
 
-
 def get_app_id_identifier(app_id):
     return clean_string(
-        app_id.get("identifier")
-        or app_id.get("bundleId")
-        or app_id.get("bundleID")
-        or ""
+        app_id.get("identifier") or app_id.get("bundleId") or app_id.get("bundleID") or ""
     )
-
 
 def get_app_id_id(app_id):
     return app_id.get("appIdId") or app_id.get("id")
 
-
 def create_or_get_app_id(dev_api, bundle_id, name):
-    """Tạo Exact App ID nếu chưa có, không tạo wildcard."""
     existing = find_app_id(dev_api, bundle_id)
     if existing:
         log_ok(f"Dùng App ID có sẵn: {bundle_id}")
         return existing
-
     created = dev_api.create_app_id(bundle_id, name)
     if not created:
         log_error(f"Không tạo được App ID {bundle_id}: {dev_api.last_error}")
         return None
-
     log_ok(f"Đã tạo App ID: {bundle_id}")
     return created
-
 
 def decode_provisioning_profile(profile):
     if not profile:
         return None
-
     encoded = (
-        profile.get("encodedProfile")
-        or profile.get("content")
-        or profile.get("profileContent")
+        profile.get("encodedProfile") or profile.get("content") or profile.get("profileContent")
     )
     if not encoded:
         return None
-
     try:
         data = utils.decode_apple_data_field(encoded)
         return data if data else None
@@ -410,23 +370,17 @@ def decode_provisioning_profile(profile):
         log_error(f"Không decode được provisioning profile: {e}")
         return None
 
-
 def download_profile_for_app(dev_api, app_id, bundle_id):
-    """Tải profile riêng cho đúng App ID."""
     app_id_id = get_app_id_id(app_id)
     if not app_id_id:
         log_error(f"App ID {bundle_id} không có ID nội bộ.")
         return None
-
     profile = dev_api.download_provisioning_profile(app_id_id)
     content = decode_provisioning_profile(profile)
-
     if not content:
         log_error(f"Không tải được provisioning profile cho {bundle_id}.")
         return None
-
     return content
-
 
 def write_embedded_profile(bundle_path, profile_content):
     profile_path = os.path.join(bundle_path, "embedded.mobileprovision")
@@ -434,25 +388,18 @@ def write_embedded_profile(bundle_path, profile_content):
         f.write(profile_content)
     return profile_path
 
-
 def get_extension_bundles(app_bundle):
-    """Trả về [(appex_path, bundle_id)] sau khi Bundle ID đã được patch."""
     result = []
     plugins_dir = os.path.join(app_bundle, "PlugIns")
-
     if not os.path.isdir(plugins_dir):
         return result
-
     for item in sorted(os.listdir(plugins_dir)):
         if not item.endswith(".appex"):
             continue
-
         appex_path = os.path.join(plugins_dir, item)
         plist_path = os.path.join(appex_path, "Info.plist")
-
         if not os.path.isfile(plist_path):
             continue
-
         try:
             with open(plist_path, "rb") as f:
                 data = plistlib.load(f)
@@ -461,111 +408,64 @@ def get_extension_bundles(app_bundle):
                 result.append((appex_path, bundle_id))
         except Exception as e:
             log_warn(f"Không đọc được Info.plist của {item}: {e}")
-
     return result
 
-
 def get_certificate_team_id(cert_path):
-    """Lấy Team ID thật từ OU trong certificate PEM."""
     try:
         with open(cert_path, "rb") as f:
             cert = x509.load_pem_x509_certificate(f.read())
-
         from cryptography.x509.oid import NameOID
-
-        values = cert.subject.get_attributes_for_oid(
-            NameOID.ORGANIZATIONAL_UNIT_NAME
-        )
+        values = cert.subject.get_attributes_for_oid(NameOID.ORGANIZATIONAL_UNIT_NAME)
         for attr in values:
             value = clean_string(attr.value)
             if re.fullmatch(r"[A-Z0-9]{10}", value):
                 return value
-
-        # Một số certificate có thể có nhiều trường subject khác nhau.
         for attr in cert.subject:
             value = clean_string(attr.value)
             if re.fullmatch(r"[A-Z0-9]{10}", value):
                 return value
-
     except Exception as e:
         log_warn(f"Không đọc được Team ID từ certificate: {e}")
-
     return None
 
-
 def prepare_provisioning(dev_api, app_bundle, app_name, team_id):
-    """
-    Mỗi bundle (app + từng .appex) có:
-      1. Exact App ID riêng
-      2. provisioning profile riêng
-      3. embedded.mobileprovision riêng
-
-    Trả về danh sách profile theo thứ tự main app -> extensions.
-    """
     profiles = []
-
-    # Main app
     main_bundle_id = clean_string(utils.get_bundle_id(app_bundle))
     if not main_bundle_id:
         log_error("Main Bundle ID rỗng.")
         return None
-
-    main_app_id = create_or_get_app_id(
-        dev_api, main_bundle_id, app_name
-    )
+    main_app_id = create_or_get_app_id(dev_api, main_bundle_id, app_name)
     if not main_app_id:
         return None
-
-    main_profile = download_profile_for_app(
-        dev_api, main_app_id, main_bundle_id
-    )
+    main_profile = download_profile_for_app(dev_api, main_app_id, main_bundle_id)
     if not main_profile:
         return None
-
     main_profile_path = write_embedded_profile(app_bundle, main_profile)
     profiles.append((app_bundle, main_bundle_id, main_profile_path))
     log_ok(f"Profile riêng cho App: {main_bundle_id}")
 
-    # Extensions
     for appex_path, ext_bundle_id in get_extension_bundles(app_bundle):
         ext_name = clean_string(
             os.path.basename(appex_path).removesuffix(".appex")
         ) or f"{app_name} Extension"
-
         log_info(f"Xử lý Extension: {ext_bundle_id}")
-
-        ext_app_id = create_or_get_app_id(
-            dev_api, ext_bundle_id, ext_name
-        )
+        ext_app_id = create_or_get_app_id(dev_api, ext_bundle_id, ext_name)
         if not ext_app_id:
             return None
-
-        ext_profile = download_profile_for_app(
-            dev_api, ext_app_id, ext_bundle_id
-        )
+        ext_profile = download_profile_for_app(dev_api, ext_app_id, ext_bundle_id)
         if not ext_profile:
             return None
-
-        ext_profile_path = write_embedded_profile(
-            appex_path, ext_profile
-        )
-        profiles.append(
-            (appex_path, ext_bundle_id, ext_profile_path)
-        )
+        ext_profile_path = write_embedded_profile(appex_path, ext_profile)
+        profiles.append((appex_path, ext_bundle_id, ext_profile_path))
         log_ok(f"Profile riêng cho Extension: {ext_bundle_id}")
-
     return profiles
-
 
 # === DO SIDELOAD ===
 def do_sideload(ipa_path, apple_id, password):
-    """Sideload với Team ID thật + profile riêng cho từng bundle."""
     log_step(1, "Xác thực Apple ID")
-
     if not check_usbmuxd():
         log_error("usbmuxd chưa chạy! Chạy 'Setup USB' trước.")
         return False
-
     udid = device_link.get_udid_from_usb()
     if not udid:
         log_error("Không tìm thấy thiết bị! Chạy 'Setup USB' trước.")
@@ -583,11 +483,9 @@ def do_sideload(ipa_path, apple_id, password):
 
     auth = AppleAuth(input_func=input)
     auth_result = auth.authenticate(apple_id, password)
-
     if not auth_result or not auth_result.get("authenticated"):
         log_error("Xác thực thất bại.")
         return False
-
     if auth_result.get("authenticated") == "2fa_completed":
         log_warn("2FA hoàn tất. Hãy chạy lại.")
         return False
@@ -606,24 +504,17 @@ def do_sideload(ipa_path, apple_id, password):
     if not teams:
         log_error("Không lấy được Team ID. Kiểm tra tài khoản Developer.")
         return False
-
     team_id = clean_string(
-        teams[0].get("teamId")
-        or teams[0].get("teamID")
-        or teams[0].get("id")
-        or ""
+        teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id") or ""
     )
-
     if not re.fullmatch(r"[A-Z0-9]{10}", team_id):
         log_error(f"Team ID Apple trả về không hợp lệ: {team_id!r}")
         return False
-
     dev_api.set_team(team_id)
     log_ok(f"Team ID thật: {team_id}")
 
     log_step(3, "Kiểm tra thiết bị trên Apple")
     devices = dev_api.list_devices() or []
-
     if not any(
         clean_string(d.get("deviceNumber") or d.get("udid") or "") == udid
         for d in devices
@@ -640,69 +531,39 @@ def do_sideload(ipa_path, apple_id, password):
 
     cert_exists = os.path.isfile(cert_pem_path)
     key_exists = os.path.isfile(key_pem_path)
-
     if cert_exists != key_exists:
-        log_error(
-            "cert.pem và key.pem không đồng bộ. "
-            "Xoá/copy lại đúng cặp certificate + private key."
-        )
+        log_error("cert.pem và key.pem không đồng bộ.")
         return False
 
     if not cert_exists:
         log_info("Chưa có certificate local. Đang tạo certificate mới...")
-        cert_data = dev_api.create_certificate(
-            f"sideload-{uuid.uuid4().hex[:8]}"
-        )
-
+        cert_data = dev_api.create_certificate(f"sideload-{uuid.uuid4().hex[:8]}")
         if not cert_data:
-            log_error(
-                f"Không tạo được certificate: {dev_api.last_error}"
-            )
+            log_error(f"Không tạo được certificate: {dev_api.last_error}")
             return False
-
         cert_content = (
             cert_data.get("attributes", {}).get("certificateContent")
             or cert_data.get("certContent")
         )
         key_pem = cert_data.get("_private_key_pem")
-
         if not cert_content or not key_pem:
             log_error("Apple không trả đủ certificate/private key.")
             return False
-
-        utils.save_certificate_as_pem(
-            cert_content, cert_pem_path
-        )
-
+        utils.save_certificate_as_pem(cert_content, cert_pem_path)
         with open(key_pem_path, "w", encoding="utf-8") as f:
             f.write(key_pem)
-
         log_ok("Đã tạo certificate mới.")
     else:
         log_ok("Dùng certificate + private key có sẵn.")
 
-    # Tuyệt đối không tự revoke certificate cũ.
     cert_team_id = get_certificate_team_id(cert_pem_path)
-
     if not cert_team_id:
-        log_error(
-            "Không xác định được Team ID trong cert.pem. "
-            "Không tiếp tục ký để tránh ký sai team."
-        )
+        log_error("Không xác định được Team ID trong cert.pem.")
         return False
-
     log_info(f"Team ID trong certificate: {cert_team_id}")
-
     if cert_team_id != team_id:
-        log_error(
-            f"Certificate Team ID ({cert_team_id}) khác "
-            f"Developer Team ID ({team_id})."
-        )
-        log_error(
-            "Hãy dùng đúng cặp cert.pem + key.pem của Team này."
-        )
+        log_error(f"Certificate Team ID ({cert_team_id}) khác Developer Team ID ({team_id}).")
         return False
-
     log_ok("Certificate Team ID khớp Developer Team.")
 
     log_step(5, "Extract IPA & đổi Bundle ID")
@@ -718,59 +579,43 @@ def do_sideload(ipa_path, apple_id, password):
         log_error("Không tìm thấy .app trong IPA.")
         return False
 
-    original_bundle_id = clean_string(
-        utils.get_bundle_id(app_bundle)
-    )
-    app_name = clean_string(utils.get_app_name(app_bundle))
+    # Xóa SC_Info (FairPlay DRM) nếu có
+    fairplay_dir = os.path.join(app_bundle, "SC_Info")
+    if os.path.isdir(fairplay_dir):
+        shutil.rmtree(fairplay_dir)
+        log_info("Đã xóa SC_Info (FairPlay DRM).")
 
+    original_bundle_id = clean_string(utils.get_bundle_id(app_bundle))
+    app_name = clean_string(utils.get_app_name(app_bundle))
     if not original_bundle_id:
         log_error("IPA không có CFBundleIdentifier.")
         return False
-
-    log_info(
-        f"App: {app_name} | Bundle ID gốc: {original_bundle_id}"
-    )
+    log_info(f"App: {app_name} | Bundle ID gốc: {original_bundle_id}")
 
     bundle_id = patch_bundle_ids(app_bundle, team_id)
     log_ok(f"Bundle ID mới: {bundle_id}")
 
     log_step(6, "Tạo App ID & Provisioning Profile riêng")
-
-    profiles = prepare_provisioning(
-        dev_api,
-        app_bundle,
-        app_name,
-        team_id
-    )
-
+    profiles = prepare_provisioning(dev_api, app_bundle, app_name, team_id)
     if not profiles:
         log_error("Chuẩn bị provisioning profile thất bại.")
         return False
-
-    log_ok(
-        f"Đã chuẩn bị {len(profiles)} provisioning profile "
-        f"(App + Extension)."
-    )
+    log_ok(f"Đã chuẩn bị {len(profiles)} provisioning profile (App + Extension).")
 
     log_step(7, "Ký IPA bằng zsign")
-
     if not check_zsign():
         return False
-
     zsign_path = find_zsign()
     if not zsign_path:
         return False
 
-    signed_ipa = os.path.join(
-        WORK_DIR, f"{app_name}_signed.ipa"
-    )
+    signed_ipa = os.path.join(WORK_DIR, f"{app_name}_signed.ipa")
     tmp_dir = os.path.join(WORK_DIR, "zsign_tmp")
-
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # zsign hỗ trợ nhiều -m: main app + từng extension.
+    # zsign ký in-place vào app_bundle (không dùng -o để tự đóng gói lại)
     zsign_cmd = [
         zsign_path,
         "-f",
@@ -778,20 +623,14 @@ def do_sideload(ipa_path, apple_id, password):
         "-c", cert_pem_path,
         "-k", key_pem_path,
     ]
-
-    for bundle_path, bundle_id, profile_path in profiles:
+    for bundle_path, bid, profile_path in profiles:
         if not os.path.isfile(profile_path):
-            log_error(
-                f"Thiếu provisioning profile: {profile_path}"
-            )
+            log_error(f"Thiếu provisioning profile: {profile_path}")
             return False
         zsign_cmd.extend(["-m", profile_path])
-        log_info(f"[ZSIGN] -m {bundle_id}")
+        log_info(f"[ZSIGN] -m {bid}")
 
-    zsign_cmd.extend([
-        "-o", signed_ipa,
-        app_bundle
-    ])
+    zsign_cmd.append(app_bundle)
 
     try:
         utils.run_command(zsign_cmd)
@@ -799,72 +638,71 @@ def do_sideload(ipa_path, apple_id, password):
         log_error(f"Ký IPA thất bại: {e}")
         return False
 
-    if not os.path.isfile(signed_ipa):
-        log_error("zsign không tạo ra IPA đầu ra.")
+    # Verify chữ ký
+    if not verify_signed_bundle(app_bundle):
+        log_error("Chữ ký không hoàn chỉnh, dừng lại.")
         return False
 
-    log_ok(f"Đã ký IPA: {signed_ipa}")
+    # Đóng gói lại IPA giữ symlink
+    log_info("Đóng gói lại IPA (giữ symlink)...")
+    try:
+        utils.package_ipa(work_dir, signed_ipa)
+    except Exception as e:
+        log_error(f"Đóng gói IPA thất bại: {e}")
+        return False
+
+    if not os.path.isfile(signed_ipa):
+        log_error("Không tạo được IPA đầu ra.")
+        return False
+    log_ok(f"Đã ký + đóng gói IPA: {signed_ipa}")
 
     log_step(8, "Pairing & Cài đặt")
-
     pair = device_link.pair_device(udid)
     if not pair:
         log_error("Pairing thất bại.")
-        log_info("Đang kill usbmuxd do pairing thất bại...")
         kill_usbmuxd()
         return False
-
     log_ok("Pairing thành công.")
 
     try:
         installed = device_link.install_ipa(pair, signed_ipa)
         if not installed:
             raise RuntimeError("ideviceinstaller trả về thất bại")
-
         log_ok("🎉 Cài đặt thành công!")
         return True
-
     except Exception as e:
         log_error(f"Cài đặt thất bại: {e}")
-        log_info("Đang kill usbmuxd do cài đặt thất bại...")
         kill_usbmuxd()
         return False
-
 
 # === REVOKE CERTS ===
 def do_revoke_certs(apple_id, password):
     log_step(1, "Xác thực")
     auth = AppleAuth(input_func=input)
     auth_result = auth.authenticate(apple_id, password)
-    
     if not auth_result or not auth_result.get("authenticated"):
         log_error("Xác thực thất bại.")
         return False
     if auth_result.get("authenticated") == "2fa_completed":
         log_warn("2FA hoàn tất. Chạy lại.")
         return False
-    
     dsid = auth_result["dsid"]
     session_token = auth_result["session_token"]
     dev_api = DeveloperAPI(auth, dsid, session_token)
-    
     teams = dev_api.list_teams()
     if not teams:
         log_error("Không có team.")
         return False
     team_id = teams[0].get("teamId") or teams[0].get("teamID") or teams[0].get("id")
     dev_api.set_team(team_id)
-    
     certs = dev_api.list_certificates()
     if not certs:
         log_info("Không có certificate nào.")
         return True
-    
     log_info(f"Có {len(certs)} certificate:")
     for i, cert in enumerate(certs, 1):
         attrs = cert.get("attributes", {})
         print(f"  [{i}] id={cert.get('id')} name={attrs.get('name')} exp={attrs.get('expirationDate')}")
-    
     selector = input("Chọn certificate cần thu hồi (số hoặc 'all'): ").strip().lower()
     if selector == "all":
         targets = certs
@@ -877,7 +715,6 @@ def do_revoke_certs(apple_id, password):
         if not targets:
             log_error("Chọn không hợp lệ.")
             return False
-    
     for cert in targets:
         ok = dev_api.revoke_certificate(cert.get("id"))
         log_ok(f"Revoke {cert.get('id')} {'thành công' if ok else 'thất bại'}")
@@ -890,39 +727,36 @@ def main():
     print(f"{C.BOLD}{C.HEADER}╚══════════════════════════════════════════╝{C.ENDC}")
     print()
     print(f"{C.OKCYAN}📱 iPhone Status:{C.ENDC} {check_iphone_status()}")
-    
     print()
-    
+
     saved_id = config.get_apple_id()
     saved_pass = config.get_password()
-    
+
     print("1. Sideload IPA")
     print("2. Thu hồi cert")
     print("3. Setup USB & USBMUXD")
     print("4. Test Pairing")
     print("5. Thoát")
     choice = input("Chọn (1-5): ").strip()
-    
+
     if choice == "1":
         if not check_usbmuxd():
             log_error("usbmuxd chưa chạy! Chạy 'Setup USB' (mục 3) trước.")
             main()
             return
-        
         udid = device_link.get_udid_from_usb()
         if not udid:
             log_error("Không tìm thấy thiết bị! Chạy 'Setup USB' (mục 3) trước.")
             main()
             return
-        
+
         ipa = input("Đường dẫn IPA: ").strip()
         ipa = os.path.expanduser(ipa)
         ipa = os.path.abspath(ipa)
-        
         if not os.path.exists(ipa):
             log_error(f"File IPA không tồn tại: {ipa}")
             return
-        
+
         if saved_id:
             print(f"{C.OKCYAN}Apple ID đã lưu:{C.ENDC} {saved_id}")
             if input("Dùng? (y/n): ").lower() == "y":
@@ -933,7 +767,7 @@ def main():
         else:
             apple_id = input("Apple ID: ").strip()
             config.set_apple_id(apple_id)
-        
+
         if saved_pass and apple_id == saved_id:
             if input("Dùng mật khẩu đã lưu? (y/n): ").lower() == "y":
                 password = saved_pass
@@ -943,9 +777,9 @@ def main():
         else:
             password = getpass.getpass("Mật khẩu: ")
             config.save_password(password)
-        
+
         do_sideload(ipa, apple_id, password)
-    
+
     elif choice == "2":
         if saved_id:
             print(f"{C.OKCYAN}Apple ID đã lưu:{C.ENDC} {saved_id}")
@@ -957,7 +791,7 @@ def main():
         else:
             apple_id = input("Apple ID: ").strip()
             config.set_apple_id(apple_id)
-        
+
         if saved_pass and apple_id == saved_id:
             if input("Dùng mật khẩu đã lưu? (y/n): ").lower() == "y":
                 password = saved_pass
@@ -967,17 +801,17 @@ def main():
         else:
             password = getpass.getpass("Mật khẩu: ")
             config.save_password(password)
-        
+
         do_revoke_certs(apple_id, password)
-    
+
     elif choice == "3":
         setup_usb_connection()
         main()
-    
+
     elif choice == "4":
         test_pairing()
         main()
-    
+
     elif choice == "5":
         print("Đã thoát.")
         sys.exit(0)
