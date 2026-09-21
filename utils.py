@@ -56,7 +56,7 @@ def extract_ipa(ipa_path, output_dir):
 
     print("[IPA] Giải nén xong và giữ nguyên cấu trúc iOS.")
     return output_dir
-    p
+    
 def package_ipa(source_dir, output_ipa, prefer_ditto=True):
     """
     Đóng gói thư mục thành IPA, giữ nguyên symlink + quyền POSIX.
