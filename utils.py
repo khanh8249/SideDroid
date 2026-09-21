@@ -25,7 +25,38 @@ def run_command(command, cwd=None, extra_env=None):
         if e.stderr:
             print(f"--- stderr ---\n{e.stderr}")
         raise
-        
+
+def extract_ipa(ipa_path, output_dir):
+    print(f"[IPA] Giải nén {ipa_path} vào {output_dir}...")
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    with zipfile.ZipFile(ipa_path, 'r') as zip_ref:
+        for info in zip_ref.infolist():
+            extracted_path = os.path.join(output_dir, info.filename)
+            os.makedirs(os.path.dirname(extracted_path), exist_ok=True)
+
+            if info.is_dir():
+                os.makedirs(extracted_path, exist_ok=True)
+                continue
+
+            if (info.external_attr >> 28) == 0xA:
+                link_target = zip_ref.read(info).decode('utf-8').strip()
+                if os.path.exists(extracted_path) or os.path.islink(extracted_path):
+                    os.unlink(extracted_path)
+                os.symlink(link_target, extracted_path)
+            else:
+                with zip_ref.open(info) as source, open(extracted_path, 'wb') as target:
+                    shutil.copyfileobj(source, target)
+
+                unix_attributes = info.external_attr >> 16
+                if unix_attributes != 0:
+                    os.chmod(extracted_path, unix_attributes & 0o777)
+
+    print("[IPA] Giải nén xong và giữ nguyên cấu trúc iOS.")
+    return output_dir
+    p
 def package_ipa(source_dir, output_ipa, prefer_ditto=True):
     """
     Đóng gói thư mục thành IPA, giữ nguyên symlink + quyền POSIX.
