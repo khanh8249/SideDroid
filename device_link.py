@@ -23,10 +23,8 @@ def check_libimobiledevice():
                 text=True,
                 timeout=5,
             )
-
             if result.returncode != 0:
                 missing.append(tool)
-
         except Exception:
             missing.append(tool)
 
@@ -34,7 +32,6 @@ def check_libimobiledevice():
         print("[device_link] ❌ Thiếu công cụ:")
         for tool in missing:
             print(f"  - {tool}")
-
         print("[device_link] Cài bằng:")
         print("  pkg install libimobiledevice")
         return False
@@ -62,12 +59,9 @@ def _run(cmd, timeout=30):
 
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
-
         print(f"[device_link] Lệnh thất bại: {' '.join(cmd)}")
-
         if stderr:
             print(f"[device_link] {stderr}")
-
         raise
 
     except subprocess.TimeoutExpired:
@@ -94,11 +88,8 @@ def get_udid_from_usb():
             print("[device_link] Không tìm thấy thiết bị iOS.")
             return None
 
-        # idevice_id có thể trả nhiều thiết bị.
-        # Chọn UDID hợp lệ đầu tiên.
         for line in output.splitlines():
             udid = line.strip()
-
             if (
                 len(udid) == 40
                 and all(
@@ -125,7 +116,6 @@ def pair_device(udid=None):
 
     if not udid:
         udid = get_udid_from_usb()
-
         if not udid:
             return None
 
@@ -156,8 +146,6 @@ def pair_device(udid=None):
                 "paired": True,
             }
 
-        # Một số phiên bản idevicepair có thể trả
-        # SUCCESS qua stderr hoặc exit code 0.
         print("[device_link] Pairing hoàn tất.")
         return {
             "UDID": udid,
@@ -167,6 +155,16 @@ def pair_device(udid=None):
     except Exception as e:
         print(f"[device_link] Lỗi pairing: {e}")
         return None
+
+
+def validate_pair_record(pair_record):
+    """Kiểm tra pair_record."""
+    return bool(pair_record and pair_record.get("paired"))
+
+
+def reset_mux_device():
+    """Placeholder cho tương lai. Không cần reset vì idevicepair tự xử lý."""
+    pass
 
 
 def install_ipa(pair_record, ipa_path, progress_cb=None):
@@ -186,34 +184,22 @@ def install_ipa(pair_record, ipa_path, progress_cb=None):
         )
         return False
 
-    # Lấy UDID hiện tại.
     udid = get_udid_from_usb()
-
     if not udid:
         print("[device_link] ❌ Không tìm thấy thiết bị!")
         return False
 
-    # Kiểm tra pair record.
     if not pair_record:
-        print(
-            "[device_link] ❌ Không có pair record."
-        )
+        print("[device_link] ❌ Không có pair record.")
         return False
 
     if not pair_record.get("paired"):
-        print(
-            "[device_link] ❌ Thiết bị chưa được pairing!"
-        )
+        print("[device_link] ❌ Thiết bị chưa được pairing!")
         return False
 
-    # Nếu pair_record có UDID thì đảm bảo đúng thiết bị.
     paired_udid = pair_record.get("UDID")
-
     if paired_udid and paired_udid != udid:
-        print(
-            "[device_link] ❌ UDID trong pair record "
-            "không khớp thiết bị hiện tại."
-        )
+        print("[device_link] ❌ UDID trong pair record không khớp.")
         print(f"[device_link] Pair record: {paired_udid}")
         print(f"[device_link] Thiết bị:      {udid}")
         return False
@@ -223,10 +209,8 @@ def install_ipa(pair_record, ipa_path, progress_cb=None):
 
     cmd = [
         "ideviceinstaller",
-        "-u",
-        udid,
-        "install",
-        ipa_path,
+        "-u", udid,
+        "install", ipa_path,
     ]
 
     try:
@@ -242,35 +226,57 @@ def install_ipa(pair_record, ipa_path, progress_cb=None):
             if process.stdout:
                 for line in process.stdout:
                     line = line.rstrip()
-
                     if not line:
                         continue
-
                     print(line)
 
-                    # Hỗ trợ progress dạng:
-                    # 50%
                     if "%" in line:
                         try:
-                            before_percent = line.split(
-                                "%",
-                                1,
-                            )[0]
-
+                            before_percent = line.split("%", 1)[0]
                             number = before_percent.split()[-1]
                             pct = int(float(number))
-
                             pct = max(0, min(100, pct))
+                            progress_cb(pct, line)
+                        except (ValueError, IndexError):
+                            pass
 
-                            progress_cb(
-                                pct,
-                                line,
-                            )
+            process.wait()
 
-                        def validate_pair_record(pair_record):
-    """Kiểm tra pair_record"""
-    return bool(pair_record and pair_record.get("paired"))
+            if process.returncode != 0:
+                print(
+                    f"[device_link] ❌ ideviceinstaller "
+                    f"exit code: {process.returncode}"
+                )
+                return False
 
-def reset_mux_device():
-    """Không cần reset vì tidevice tự xử lý"""
-    pass
+            return True
+
+        else:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            if result.stdout.strip():
+                print(result.stdout.strip())
+            if result.stderr.strip():
+                print(result.stderr.strip())
+
+            if result.returncode != 0:
+                print(
+                    f"[device_link] ❌ ideviceinstaller "
+                    f"exit code: {result.returncode}"
+                )
+                return False
+
+            return True
+
+    except subprocess.TimeoutExpired:
+        print("[device_link] ❌ Timeout khi cài đặt.")
+        return False
+
+    except Exception as e:
+        print(f"[device_link] ❌ Lỗi cài đặt: {e}")
+        return False
