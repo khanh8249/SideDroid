@@ -267,5 +267,10 @@ def install_ipa(pair_record, ipa_path, progress_cb=None):
                                 line,
                             )
 
-                        except Exception:
-                            pass
+                        def validate_pair_record(pair_record):
+    """Kiểm tra pair_record"""
+    return bool(pair_record and pair_record.get("paired"))
+
+def reset_mux_device():
+    """Không cần reset vì tidevice tự xử lý"""
+    pass
