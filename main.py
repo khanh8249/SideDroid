@@ -21,6 +21,20 @@ from apple_auth import AppleAuth, fetch_official_servers
 from developer_api import DeveloperAPI, classify_app_id_error
 from cryptography import x509
 
+# === PROMAX: certificates module ===
+try:
+    from certificates import (
+        build_full_chain,
+        chain_to_pem_bundle,
+        write_chain_file,
+        verify_chain,
+        describe_chain,
+    )
+    CERTIFICATES_AVAILABLE = True
+except ImportError as e:
+    CERTIFICATES_AVAILABLE = False
+    _CERTS_IMPORT_ERR = str(e)
+
 WORK_DIR = os.path.expanduser("~/.sideload")
 os.makedirs(WORK_DIR, exist_ok=True)
 
@@ -41,7 +55,7 @@ def log_warn(msg): print(f"{C.WARNING}[WARN]{C.ENDC} {msg}")
 def log_error(msg): print(f"{C.FAIL}[ERROR]{C.ENDC} {msg}")
 def log_step(step, msg): print(f"\n{C.BOLD}{C.HEADER}── Bước {step} ──{C.ENDC} {msg}")
 
-# === HELPER: LÀM SẠCH STRING ===
+# === HELPER ===
 def clean_string(s):
     if s is None:
         return ""
@@ -115,7 +129,6 @@ def check_zsign():
 
 # === VERIFY SIGNATURE ===
 def verify_signed_bundle(app_bundle):
-    """Kiểm tra _CodeSignature/CodeResources tồn tại và đọc được."""
     cs = os.path.join(app_bundle, "_CodeSignature", "CodeResources")
     if not os.path.isfile(cs):
         log_error(f"Thiếu _CodeSignature/CodeResources trong {app_bundle}")
@@ -128,6 +141,41 @@ def verify_signed_bundle(app_bundle):
         return False
     log_ok("CodeResources hợp lệ.")
     return True
+
+# === PROMAX: CHAIN HANDLING ===
+def handle_certificate_chain(cert_pem_path):
+    """
+    Xử lý chain: verify + ghi chain.pem.
+    Trả về đường dẫn chain.pem nếu thành công, hoặc cert_pem_path nếu không có module.
+    """
+    if not CERTIFICATES_AVAILABLE:
+        log_warn(f"Module certificates không có sẵn ({_CERTS_IMPORT_ERR})")
+        log_info("→ zsign sẽ dùng cert lá trực tiếp, iOS tự verify WWDR")
+        return cert_pem_path
+
+    try:
+        with open(cert_pem_path, encoding="utf-8") as f:
+            user_pem = f.read()
+
+        chain = build_full_chain(user_pem)
+        log_info(f"Chain bao gồm {len(chain)} cert:")
+        for line in describe_chain(chain).splitlines():
+            log_info(line)
+
+        if not verify_chain(chain):
+            log_warn("Chain KHÔNG khớp issuer — kiểm tra WWDR G3 trong assets/")
+            return cert_pem_path
+
+        chain_pem_path = os.path.join(WORK_DIR, "chain.pem")
+        with open(chain_pem_path, "w", encoding="utf-8") as f:
+            f.write(chain_to_pem_bundle(chain))
+        log_ok(f"Chain hợp lệ → ghi {chain_pem_path}")
+        return chain_pem_path
+
+    except Exception as e:
+        log_warn(f"Lỗi xử lý chain: {e}")
+        log_info("→ Fallback dùng cert lá trực tiếp")
+        return cert_pem_path
 
 # === IPHONE STATUS ===
 def check_iphone_status():
@@ -324,7 +372,7 @@ def patch_bundle_ids(app_bundle_path, team_id):
                         log_ok(f"[PATCH] Extension: {ext_original_id} -> {ext_new_id}")
     return new_bundle_id
 
-# === APP ID / PROVISIONING HELPERS ===
+# === APP ID / PROVISIONING ===
 def find_app_id(dev_api, bundle_id):
     bundle_id = clean_string(bundle_id)
     for app_id in dev_api.list_app_ids() or []:
@@ -566,6 +614,9 @@ def do_sideload(ipa_path, apple_id, password):
         return False
     log_ok("Certificate Team ID khớp Developer Team.")
 
+    # === PROMAX: Xử lý chain ===
+    signing_cert_path = handle_certificate_chain(cert_pem_path)
+
     log_step(5, "Extract IPA & đổi Bundle ID")
     work_dir = os.path.join(WORK_DIR, "extract")
     if os.path.exists(work_dir):
@@ -579,7 +630,6 @@ def do_sideload(ipa_path, apple_id, password):
         log_error("Không tìm thấy .app trong IPA.")
         return False
 
-    # Xóa SC_Info (FairPlay DRM) nếu có
     fairplay_dir = os.path.join(app_bundle, "SC_Info")
     if os.path.isdir(fairplay_dir):
         shutil.rmtree(fairplay_dir)
@@ -615,12 +665,13 @@ def do_sideload(ipa_path, apple_id, password):
         shutil.rmtree(tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # zsign ký in-place vào app_bundle (không dùng -o để tự đóng gói lại)
+    # PROMAX: dùng signing_cert_path (chain.pem nếu có, cert.pem nếu không)
+    log_info(f"[ZSIGN] cert: {signing_cert_path}")
     zsign_cmd = [
         zsign_path,
         "-f",
         "-t", tmp_dir,
-        "-c", cert_pem_path,
+        "-c", signing_cert_path,
         "-k", key_pem_path,
     ]
     for bundle_path, bid, profile_path in profiles:
@@ -638,12 +689,10 @@ def do_sideload(ipa_path, apple_id, password):
         log_error(f"Ký IPA thất bại: {e}")
         return False
 
-    # Verify chữ ký
     if not verify_signed_bundle(app_bundle):
         log_error("Chữ ký không hoàn chỉnh, dừng lại.")
         return False
 
-    # Đóng gói lại IPA giữ symlink
     log_info("Đóng gói lại IPA (giữ symlink)...")
     try:
         utils.package_ipa(work_dir, signed_ipa)
@@ -724,8 +773,15 @@ def do_revoke_certs(apple_id, password):
 def main():
     print(f"{C.BOLD}{C.HEADER}╔══════════════════════════════════════════╗{C.ENDC}")
     print(f"{C.BOLD}{C.HEADER}║     iOS Sideload Tool for Termux        ║{C.ENDC}")
+    print(f"{C.BOLD}{C.HEADER}║         PROMAX EDITION                   ║{C.ENDC}")
     print(f"{C.BOLD}{C.HEADER}╚══════════════════════════════════════════╝{C.ENDC}")
     print()
+
+    if CERTIFICATES_AVAILABLE:
+        print(f"{C.OKGREEN}✅ certificates module loaded{C.ENDC}")
+    else:
+        print(f"{C.WARNING}⚠️ certificates module NOT available: {_CERTS_IMPORT_ERR}{C.ENDC}")
+
     print(f"{C.OKCYAN}📱 iPhone Status:{C.ENDC} {check_iphone_status()}")
     print()
 
