@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""apple_auth.py - Apple ID Auth via GSA/SRP + 2FA (khong proxy)"""
+"""apple_auth.py - Apple ID Auth via GSA/SRP + 2FA (MAKE BY KHANH)"""
 
 import os
 import uuid
